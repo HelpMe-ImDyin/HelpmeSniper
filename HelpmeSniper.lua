@@ -1,4 +1,4 @@
--- Helpme Sniper v0.4
+-- Helpme Sniper v0.5
 -- Personal quick-buy sniper for stackable auction house items (cloth, dye, herbs).
 -- Standalone: scans the auction house itself, no other addons needed.
 --
@@ -6,14 +6,14 @@
 --   Focus      one item, searched as fast as the game allows, live listings
 --   Snipe      the whole watch list takes turns being searched
 --   Watch List add items (drag / shift-click / item ID), set max price, quantity, on/off
---   Settings   gold to keep, extra confirm for big buys, search speed, auto-buy, count down
+--   Settings   gold to keep, search speed, one-press buying, count down reset time
 --   History    what you bought and how much you spent today
 --
 -- Buying: one press of the buy key asks the auction house for the exact price (the game
 -- requires a real key press for that). When the price comes back at or under your max, the
 -- addon buys straight away. If the game ever refuses the automatic buy, it falls back to
 -- "press again to buy". Spamming the key is safe: extra presses are ignored while a buy is
--- in progress. Buys over your "extra confirm" amount always wait for Shift + click.
+-- in progress. A typo guard refuses to buy when your max is over double the usual price.
 -- Works only for items sold by quantity (cloth, herbs, dye, ...), not gear or bags.
 
 local ADDON_NAME = ...
@@ -25,16 +25,15 @@ BINDING_NAME_HELPMESNIPER_BUY = "Buy (one press; safe to spam)"
 
 -- Prices are stored in copper (100 copper = 1 silver, 10000 copper = 1 gold).
 local DEFAULTS = {
-	version = 4,
+	version = 5,
 	interval = 0.6,
 	autoStart = true,
 	sound = true,
-	locked = false,
+	locked = true, -- so fast clicking can't drag the window around
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
-	countdown = false, -- count purchases against the quantity
+	countdown = true, -- quantity is a hard total (untick to buy up to the quantity on every click)
 	resetMinutes = 5, -- count down starts over after this many minutes without buying that item
 	reserve = 5000, -- keep 50s
-	maxSpend = 20000, -- extra confirm above 2g
 	tab = "focus",
 	mode = "all", -- "focus" = only the Focus tab's item is searched, "all" = the whole watch list
 	items = {
@@ -67,8 +66,10 @@ local sendTimes = {}
 local awaiting -- { id = itemID, t = time sent }
 local priorityID, focusID
 local results = {} -- [itemID] = { avail, total, cheapest }
-local pending -- { itemID, qty, expected, quote, stage = quoting|big|ready|waitline|buying, t, auto }
+local pending -- { itemID, qty, expected, quote, stage = quoting|ready|waitline|buying, t, auto }
 local selected, editID
+local dealMsgID -- the item whose "Deal:" message is on the status line, so it can be cleared
+local typingMax -- the Focus max price while it's being typed (for the live typo warning)
 local ui = {}
 
 -- ============================================================================
@@ -127,6 +128,7 @@ local function ItemName(id)
 end
 
 local function SetStatus(msg, r, g, b)
+	dealMsgID = nil
 	if ui.msg then
 		ui.msg:SetText(msg)
 		ui.msg:SetTextColor(r or 1, g or 1, b or 1)
@@ -143,8 +145,24 @@ local function CancelQuote()
 	end
 end
 
+-- Right after a buy the game can take a moment to lower your gold total. Until it catches
+-- up (or 10 seconds pass), the addon uses its own lower figure so it can't overspend.
+local moneyCap, moneyCapAt
+
+local function Money_Now()
+	local m = GetMoney()
+	if moneyCap then
+		if m <= moneyCap or GetTime() - moneyCapAt > 10 then
+			moneyCap = nil -- the game has caught up
+		else
+			m = moneyCap
+		end
+	end
+	return m
+end
+
 local function Spendable()
-	return math.max(0, GetMoney() - (db.reserve or 0))
+	return math.max(0, Money_Now() - (db.reserve or 0))
 end
 
 -- True when the auction house can take a new request right now.
@@ -265,45 +283,69 @@ local function Target()
 	return nil
 end
 
+-- Typo guard: a max more than double the usual price (or, while still learning, double
+-- the cheapest listing right now) looks like a mistake, e.g. 20g instead of 20c.
+-- Nothing is bought until you click "I meant it" (which only covers that exact max).
+-- Returns the usual price when the max looks like a typo, otherwise nil.
+local function TypoRef(itemID, max, cheapestNow)
+	local cfg = db.items[itemID]
+	local ref = Typical(itemID) or cheapestNow
+	if cfg and ref and (max or 0) > 2 * ref and cfg.okMax ~= max then return ref end
+	return nil
+end
+
+-- Works out how many to buy (and the cost) from the listings at or under your max,
+-- cheapest first, up to what you still want and what you can afford.
+local function Fill(cfg, under, typo)
+	local need = typo and 0 or Remaining(cfg)
+	local money = Spendable()
+	local avail, total = 0, 0
+	for _, l in ipairs(under) do
+		if avail >= need then break end
+		local want = need - avail
+		local afford = math.floor((money - total) / l.price)
+		local take = math.min(l.qty, want, afford)
+		if take > 0 then
+			avail = avail + take
+			total = total + take * l.price
+		end
+		if take < math.min(l.qty, want) then break end -- out of gold
+	end
+	return avail, total
+end
+
 local function Evaluate(itemID)
 	local cfg = db.items[itemID]
 	if not cfg then return end
-	local money = Spendable()
-	local avail, total, cheapest = 0, 0, nil
+	local cheapest
 	local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID) or 0
-	local listings = {}
-	for i = 1, math.min(n, LISTING_ROWS) do
-		local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
-		if not info then break end
-		listings[#listings + 1] = { price = info.unitPrice, qty = (info.quantity or 0) - (info.numOwnerItems or 0) }
-	end
-	local need = Remaining(cfg)
+	local listings, under = {}, {}
+	local active = cfg.enabled ~= false or itemID == focusID
 	for i = 1, n do
 		local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
 		if not info then break end
 		local price = info.unitPrice
-		cheapest = cheapest or price
-		if (cfg.enabled == false and itemID ~= focusID) or (cfg.max or 0) <= 0 or price > cfg.max or need <= 0 then break end
 		local q = (info.quantity or 0) - (info.numOwnerItems or 0) -- skip your own auctions
-		if q > 0 then
-			local want = need - avail
-			local afford = math.floor((money - total) / price)
-			local take = math.min(q, want, afford)
-			if take > 0 then
-				avail = avail + take
-				total = total + take * price
-			end
-			if avail >= need or take < math.min(q, want) then break end -- got enough, or out of gold
-		end
+		cheapest = cheapest or price
+		if i <= LISTING_ROWS then listings[#listings + 1] = { price = price, qty = q } end
+		local cheapEnough = active and (cfg.max or 0) > 0 and price <= cfg.max
+		if cheapEnough and q > 0 then under[#under + 1] = { price = price, qty = q } end
+		if i >= LISTING_ROWS and not cheapEnough then break end
 	end
+	local typoRef = TypoRef(itemID, cfg.max, cheapest)
+	local avail, total = Fill(cfg, under, typoRef)
 	RecordPrice(itemID, cheapest)
 	local prev = results[itemID]
-	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, time = GetTime() }
-	if avail > 0 and (not prev or prev.avail == 0) then
+	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, under = under, time = GetTime(), typo = typoRef }
+	local relevant = db.mode ~= "focus" or itemID == focusID -- don't announce other items while on Focus
+	if avail > 0 and (not prev or prev.avail == 0) and relevant then
 		PlayAlert()
 		if not pending then
-			SetStatus(("Deal: %d %s at avg %s. Press buy key."):format(avail, ItemName(itemID), Money(total / avail)), 0.3, 1, 0.3)
+			SetStatus(("Deal: %d %s at avg %s. Press BUY!"):format(avail, ItemName(itemID), Money(total / avail)), 0.3, 1, 0.3)
+			dealMsgID = itemID
 		end
+	elseif avail == 0 and dealMsgID == itemID and not pending then
+		SetStatus("") -- that deal is gone: don't leave an old message up
 	end
 	HS.Refresh()
 end
@@ -321,7 +363,6 @@ local function SendConfirm(auto)
 	C_AuctionHouse.ConfirmCommoditiesPurchase(pending.itemID, pending.qty)
 end
 
--- Big buys need Shift held while you press, so spamming can't confirm one by accident.
 function HelpmeSniper_BuyStep()
 	if not db then return end
 	if not ahOpen then
@@ -329,13 +370,7 @@ function HelpmeSniper_BuyStep()
 		return
 	end
 	if pending then
-		if pending.stage == "big" then
-			if IsShiftKeyDown() then
-				SendConfirm(false)
-			else
-				SetStatus(("BIG BUY %d %s for %s: hold Shift and click BUY to confirm."):format(pending.qty, ItemName(pending.itemID), Money(pending.quote)), 1, 0.8, 0.2)
-			end
-		elseif pending.stage == "ready" then
+		if pending.stage == "ready" then
 			if LineReady() then
 				SendConfirm(false)
 			else
@@ -357,7 +392,7 @@ function HelpmeSniper_BuyStep()
 		return
 	end
 	local r = results[id]
-	pending = { itemID = id, qty = r.avail, expected = r.total, stage = "quoting", t = GetTime() }
+	pending = { itemID = id, qty = r.avail, expected = r.total, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now() }
 	C_AuctionHouse.StartCommoditiesPurchase(id, r.avail)
 	SetStatus(("Getting price for %d %s..."):format(r.avail, ItemName(id)), 1, 1, 0)
 	HS.Refresh()
@@ -563,7 +598,8 @@ local function NumberBox(parent, x, y, w, maxLetters)
 end
 
 -- Three boxes for gold / silver / copper. onCommit(copper) runs when you press Enter or click away.
-local function MoneyBoxes(parent, x, y, onCommit)
+-- onChange(copper), if given, runs on every keystroke.
+local function MoneyBoxes(parent, x, y, onCommit, onChange)
 	local boxes = {}
 	local specs = { { w = 34, max = 5, suffix = "|cffffd700g|r" }, { w = 22, max = 2, suffix = "|cffc7c7cfs|r" }, { w = 22, max = 2, suffix = "|cffeda55fc|r" } }
 	local cx = x
@@ -578,9 +614,15 @@ local function MoneyBoxes(parent, x, y, onCommit)
 			self:ClearFocus()
 		end)
 		eb:SetScript("OnTabPressed", function() boxes[i % 3 + 1]:SetFocus() end)
+		if onChange then
+			eb:SetScript("OnTextChanged", function(_, userInput)
+				if userInput then onChange(boxes.Get()) end
+			end)
+		end
 		eb:SetScript("OnEditFocusLost", function()
 			if boxes.cancel then
 				boxes.cancel = nil
+				if onChange then onChange(nil) end -- Escape: drop the half-typed number
 				HS.Refresh()
 				return
 			end
@@ -619,6 +661,7 @@ function HS.ShowTab(key)
 		db.mode = "all"
 	end
 	HS.UpdateMode()
+	if dealMsgID and Target() ~= dealMsgID then SetStatus("") end -- switching tabs: drop a deal message that no longer applies
 	for _, t in ipairs(TABS) do
 		ui.panels[t.key]:SetShown(t.key == key)
 		if t.key == key then ui.tabs[t.key]:LockHighlight() else ui.tabs[t.key]:UnlockHighlight() end
@@ -772,7 +815,7 @@ local function BuildWatchPanel(p)
 
 	ui.editInfo = Text(p, "GameFontHighlightSmall", 2, -220, 450)
 	ui.pctLabel = Text(p, "GameFontNormalSmall", 2, -246, 120)
-	ui.pctLabel:SetText("Set max to typical x")
+	ui.pctLabel:SetText("Max = % of typical:")
 	ui.pctBtns = {}
 	for i, pct in ipairs({ 70, 80, 90, 100 }) do
 		ui.pctBtns[i] = Button(p, pct .. "%", 124 + (i - 1) * 54, -242, 50, 20, function()
@@ -790,56 +833,50 @@ local function BuildWatchPanel(p)
 end
 
 local function BuildSettingsPanel(p)
-	Text(p, "GameFontNormalSmall", 2, -8, 220):SetText("Gold to keep (never spend below this):")
+	Text(p, "GameFontNormalSmall", 2, -8, 220):SetText("Never spend below:")
 	ui.reserve = MoneyBoxes(p, 230, -4, function(copper)
 		db.reserve = copper
 		HS.Refresh()
 	end)
-	Text(p, "GameFontNormalSmall", 2, -36, 220):SetText("Ask an extra time for buys over:")
-	ui.maxSpend = MoneyBoxes(p, 230, -32, function(copper)
-		db.maxSpend = copper
-		HS.Refresh()
-	end)
-
-	Text(p, "GameFontNormalSmall", 2, -64, 220):SetText("Search speed (seconds per search):")
-	Button(p, "-", 236, -60, 22, 20, function()
+	Text(p, "GameFontNormalSmall", 2, -36, 220):SetText("Search every (seconds):")
+	Button(p, "-", 236, -32, 22, 20, function()
 		db.interval = math.max(MIN_INTERVAL, math.floor((db.interval - 0.1) * 10 + 0.5) / 10)
 		HS.Refresh()
 	end)
-	ui.speedText = Text(p, "GameFontHighlight", 262, -63, 40, "CENTER")
-	Button(p, "+", 306, -60, 22, 20, function()
+	ui.speedText = Text(p, "GameFontHighlight", 262, -35, 40, "CENTER")
+	Button(p, "+", 306, -32, 22, 20, function()
 		db.interval = math.min(MAX_INTERVAL, math.floor((db.interval + 0.1) * 10 + 0.5) / 10)
 		HS.Refresh()
 	end)
-	ui.speedNote = Text(p, "GameFontDisableSmall", 2, -84, 450)
+	ui.speedNote = Text(p, "GameFontDisableSmall", 2, -56, 450)
 
-	ui.soundCheck = Check(p, "Play a sound when a deal appears", 0, -104, function(self) db.sound = self:GetChecked() and true or false end)
-	ui.autoCheck = Check(p, "Start scanning when the auction house opens", 0, -126, function(self) db.autoStart = self:GetChecked() and true or false end)
-	ui.lockCheck = Check(p, "Lock window position", 0, -148, function(self) db.locked = self:GetChecked() and true or false end)
-	ui.autoBuyCheck = Check(p, "One-press buying (buys when the price comes back)", 0, -170, function(self)
+	ui.soundCheck = Check(p, "Play a sound when a deal appears", 0, -78, function(self) db.sound = self:GetChecked() and true or false end)
+	ui.autoCheck = Check(p, "Start searching when the auction house opens", 0, -100, function(self) db.autoStart = self:GetChecked() and true or false end)
+	ui.lockCheck = Check(p, "Lock window position", 0, -122, function(self) db.locked = self:GetChecked() and true or false end)
+	ui.autoBuyCheck = Check(p, "Buy in one click (gets the price and buys)", 0, -144, function(self)
 		db.autoBuy = self:GetChecked() and true or false
 		db.autoBuyBlocked = nil -- ticking it again lets the addon retry
 		HS.Refresh()
 	end)
-	ui.autoBuyNote = Text(p, "GameFontDisableSmall", 296, -175, 160)
+	ui.autoBuyNote = Text(p, "GameFontDisableSmall", 296, -149, 160)
 
-	Text(p, "GameFontNormalSmall", 2, -198, 230):SetText("Count down starts over after no buys for:")
-	Button(p, "-", 236, -194, 22, 20, function()
+	Text(p, "GameFontNormalSmall", 2, -172, 230):SetText("Count down resets after no buys for:")
+	Button(p, "-", 236, -168, 22, 20, function()
 		db.resetMinutes = math.max(1, (db.resetMinutes or 5) - 1)
 		HS.Refresh()
 	end)
-	ui.resetText = Text(p, "GameFontHighlight", 262, -197, 40, "CENTER")
-	Button(p, "+", 306, -194, 22, 20, function()
+	ui.resetText = Text(p, "GameFontHighlight", 262, -171, 40, "CENTER")
+	Button(p, "+", 306, -168, 22, 20, function()
 		db.resetMinutes = math.min(120, (db.resetMinutes or 5) + 1)
 		HS.Refresh()
 	end)
-	Text(p, "GameFontHighlightSmall", 334, -198, 60):SetText("minutes")
+	Text(p, "GameFontHighlightSmall", 334, -172, 60):SetText("minutes")
 
 	local help = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	help:SetPoint("TOPLEFT", 2, -222)
+	help:SetPoint("TOPLEFT", 2, -200)
 	help:SetWidth(450)
 	help:SetJustifyH("LEFT")
-	help:SetText("Spam-click the BUY button, or set a key: Esc > Options > Keybindings > AddOns > Helpme Sniper. Big buys need Shift + click. Other auction addons scanning at the same time slow this down.")
+	help:SetText("Spam-click the BUY button, or set a key: Esc > Options > Keybindings > AddOns > Helpme Sniper.\nTypo guard: it won't buy if your max is more than double the usual price, until you click \"I meant it\".\nOther auction addons scanning at the same time slow this down.")
 end
 
 local function BuildHistoryPanel(p)
@@ -906,6 +943,7 @@ local function BuildFocusPanel(p)
 
 	Text(b, "GameFontNormalSmall", 2, -78, 94):SetText("Max price each:")
 	ui.fMoney = MoneyBoxes(b, 96, -74, function(copper)
+		typingMax = nil
 		local id = db.focusItem
 		local cfg = id and db.items[id]
 		if cfg then
@@ -914,8 +952,11 @@ local function BuildFocusPanel(p)
 			priorityID = id
 		end
 		HS.Refresh()
+	end, function(copper)
+		typingMax = copper -- live typo check while typing
+		HS.Refresh()
 	end)
-	Text(b, "GameFontNormalSmall", 244, -78, 56):SetText("Quantity:")
+	ui.fQtyLabel = Text(b, "GameFontNormalSmall", 244, -78, 56)
 	Button(b, "-", 300, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and -10 or -1) end)
 	ui.fQty = NumberBox(b, 320, -75, 40, 4)
 	ui.fQty:SetJustifyH("CENTER")
@@ -947,7 +988,7 @@ local function BuildFocusPanel(p)
 		HS.Refresh()
 	end)
 
-	Text(b, "GameFontNormalSmall", 2, -104, 120):SetText("Set max to typical x")
+	Text(b, "GameFontNormalSmall", 2, -104, 120):SetText("Max = % of typical:")
 	ui.fPct = {}
 	for i, pct in ipairs({ 70, 80, 90, 100 }) do
 		ui.fPct[i] = Button(b, pct .. "%", 124 + (i - 1) * 54, -100, 50, 20, function()
@@ -963,8 +1004,25 @@ local function BuildFocusPanel(p)
 		end)
 	end
 
-	ui.fPrices = Text(b, "GameFontHighlightSmall", 2, -128, 450)
-	ui.fDeal = Text(b, "GameFontHighlight", 2, -144, 450)
+	ui.fDeal = Text(b, "GameFontNormalLarge", 2, -126, 450)
+	ui.fPrices = Text(b, "GameFontDisableSmall", 2, -148, 450)
+	-- Typo guard override: accepts this exact max for this item (changing the max asks again).
+	ui.fOk = Button(b, "I meant it", 372, -124, 80, 20, function()
+		local id = db.focusItem
+		local cfg = id and db.items[id]
+		if cfg then
+			if typingMax then -- still typing: take the number in the boxes as your max
+				cfg.max = typingMax
+				typingMax = nil
+				for j = 1, 3 do ui.fMoney[j]:ClearFocus() end
+			end
+			cfg.okMax = cfg.max
+			results[id] = nil
+			priorityID = id
+			HS.Refresh()
+		end
+	end)
+	ui.fOk:Hide()
 
 	Text(b, "GameFontNormalSmall", 4, -166, 90, "RIGHT"):SetText("Price each")
 	Text(b, "GameFontNormalSmall", 100, -166, 70, "RIGHT"):SetText("Available")
@@ -1062,7 +1120,7 @@ local function RefreshSnipe()
 	if focusID then
 		ui.scanLine:SetText((scanning and "|cff33ff33Scanning|r" or "|cffff8833Paused|r") .. "  |cffffd100Focus: " .. ItemName(focusID) .. "|r")
 	else
-		ui.scanLine:SetText((scanning and "|cff33ff33Scanning|r" or "|cffff8833Paused|r") .. "   Gold " .. Money(GetMoney()) .. "  (keep " .. Money(db.reserve) .. ")")
+		ui.scanLine:SetText((scanning and "|cff33ff33Scanning|r" or "|cffff8833Paused|r") .. "   Gold " .. Money(GetMoney()) .. "  (never below " .. Money(db.reserve) .. ")")
 	end
 
 	local target = Target()
@@ -1080,6 +1138,10 @@ local function RefreshSnipe()
 			row.qty:SetText("|cff888888paused|r")
 			row.avg:SetText("")
 			row.name:SetTextColor(0.45, 0.45, 0.45)
+		elseif r and r.typo then
+			row.qty:SetText("|cffff5555typo?|r")
+			row.avg:SetText("|cffff5555max > 2x usual|r")
+			row.name:SetTextColor(1, 0.35, 0.35)
 		elseif r and r.avail > 0 then
 			row.qty:SetText(r.avail .. "/" .. Remaining(cfg))
 			row.avg:SetText(Money(r.total / r.avail))
@@ -1102,9 +1164,7 @@ end
 local function RefreshBuy()
 	ui.startBtn:SetText(scanning and "Stop" or "Start")
 	local target = Target()
-	if pending and pending.stage == "big" then
-		ui.buyBtn:SetText("BIG BUY " .. Money(pending.quote) .. " - SHIFT + CLICK to confirm")
-	elseif pending and pending.stage == "ready" then
+	if pending and pending.stage == "ready" then
 		ui.buyBtn:SetText("PRESS AGAIN: buy " .. pending.qty .. " for " .. Money(pending.quote))
 	elseif pending and pending.stage == "buying" then
 		ui.buyBtn:SetText("Buying " .. pending.qty .. "...")
@@ -1156,7 +1216,6 @@ end
 
 local function RefreshSettings()
 	ui.reserve.Set(db.reserve)
-	ui.maxSpend.Set(db.maxSpend)
 	ui.speedText:SetText(("%.1f"):format(db.interval))
 	local active = 0
 	for _, id in ipairs(db.order) do
@@ -1208,6 +1267,7 @@ local function RefreshFocus()
 	ui.fCount:SetChecked(db.countdown)
 	ui.fReset:SetShown(db.countdown)
 	ui.fShiftHint:SetShown(not db.countdown)
+	ui.fQtyLabel:SetText(db.countdown and "Total:" or "Per buy:")
 	local left = Remaining(cfg)
 	if db.countdown then
 		local resets = ResetIn(cfg)
@@ -1215,34 +1275,43 @@ local function RefreshFocus()
 	else
 		ui.fCountText:SetText("")
 	end
-	local countText = ""
-
 	local typ, n = Typical(id)
 	for _, btn in ipairs(ui.fPct) do btn:SetEnabled(typ ~= nil) end
 	local low = LowToday(id)
 	local r = results[id]
-	ui.fPrices:SetText(("Cheapest now: %s     Typical: %s     Low today: %s"):format(
-		(r and r.cheapest) and Money(r.cheapest) or "-",
+	ui.fPrices:SetText(("Typical %s   ·   Low today %s"):format(
 		typ and Money(typ) or ("learning " .. n .. "/" .. MIN_SAMPLES),
 		low and Money(low) or "-"))
 
-	if (cfg.max or 0) <= 0 then
-		ui.fDeal:SetText("Set your max price above to start sniping.")
+	-- The big YES / NO line: can I buy right now?
+	-- While you're typing a max, it warns straight away if the number looks like a typo.
+	local typingRef = typingMax and TypoRef(id, typingMax, r and r.cheapest)
+	local typoShown = typingRef or (not typingMax and r and r.typo)
+	ui.fOk:SetShown(typoShown and true or false)
+	ui.fDeal:SetWidth(typoShown and 365 or 450)
+	if typingRef then
+		ui.fDeal:SetText(("TYPO? %s is over double the usual %s"):format(Money(typingMax), Money(typingRef)))
+		ui.fDeal:SetTextColor(1, 0.35, 0.35)
+	elseif (cfg.max or 0) <= 0 then
+		ui.fDeal:SetText("Set your max price to start")
+		ui.fDeal:SetTextColor(1, 0.35, 0.35)
+	elseif r and r.typo then
+		ui.fDeal:SetText(("TYPO? max %s is over double the usual %s"):format(Money(cfg.max), Money(r.typo)))
 		ui.fDeal:SetTextColor(1, 0.35, 0.35)
 	elseif db.countdown and left == 0 then
-		ui.fDeal:SetText(("Done: you bought all %d. Click Reset to buy more."):format(cfg.qty))
-		ui.fDeal:SetTextColor(0.3, 1, 0.3)
+		ui.fDeal:SetText(("DONE: bought all %d. Reset to buy more"):format(cfg.qty))
+		ui.fDeal:SetTextColor(1, 0.82, 0)
 	elseif r and r.avail > 0 then
-		ui.fDeal:SetText(("DEAL: %d at avg %s (total %s). Press buy!%s"):format(r.avail, Money(r.total / r.avail), Money(r.total), countText))
+		ui.fDeal:SetText(("YES: %d at %s (your max %s)"):format(r.avail, Money(r.total / r.avail), Money(cfg.max)))
 		ui.fDeal:SetTextColor(0.3, 1, 0.3)
 	elseif r and r.cheapest then
-		ui.fDeal:SetText(("No deal yet: cheapest is %s, your max is %s.%s"):format(Money(r.cheapest), Money(cfg.max), countText))
+		ui.fDeal:SetText(("NO: cheapest %s, your max %s"):format(Money(r.cheapest), Money(cfg.max)))
 		ui.fDeal:SetTextColor(0.65, 0.65, 0.65)
 	elseif r then
-		ui.fDeal:SetText("None listed right now." .. countText)
+		ui.fDeal:SetText("NO: none listed right now")
 		ui.fDeal:SetTextColor(0.65, 0.65, 0.65)
 	else
-		ui.fDeal:SetText("Waiting for the first search..." .. countText)
+		ui.fDeal:SetText("Checking...")
 		ui.fDeal:SetTextColor(0.65, 0.65, 0.65)
 	end
 
@@ -1336,6 +1405,14 @@ local function InitDB()
 		-- v0.4 adds one-press buying and count down (the new settings come from DEFAULTS below)
 		db.version = 4
 	end
+	if db.version < 5 then
+		-- v0.5: Count down on and the window locked by default (both can be changed back);
+		-- the "ask an extra time for big buys" setting is gone.
+		db.countdown = true
+		db.locked = true
+		db.maxSpend = nil
+		db.version = 5
+	end
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
 	end
@@ -1399,10 +1476,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			if totalPrice <= cap and totalPrice <= Spendable() then
 				pending.quote = totalPrice
 				pending.t = GetTime()
-				if totalPrice > (db.maxSpend or 0) and (db.maxSpend or 0) > 0 then
-					pending.stage = "big"
-					SetStatus(("BIG BUY %d %s for %s (over your %s limit): hold Shift and click BUY to confirm."):format(pending.qty, ItemName(pending.itemID), Money(totalPrice), Money(db.maxSpend)), 1, 0.8, 0.2)
-				elseif db.autoBuy and not db.autoBuyBlocked then
+				if db.autoBuy and not db.autoBuyBlocked then
 					if LineReady() then
 						SendConfirm(true)
 					else
@@ -1466,13 +1540,48 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				cfg.bought = (cfg.bought or 0) + pending.qty
 				cfg.boughtAt = time()
 			end
-			if cfg and db.countdown and Remaining(cfg) == 0 then
-				SetStatus(("Got all %d %s. Count down done."):format(cfg.qty, ItemName(pending.itemID)), 0.3, 1, 0.3)
+			-- Your gold after this buy, even if the game hasn't updated the total yet.
+			moneyCap = (pending.moneyAtStart or Money_Now()) - total
+			moneyCapAt = GetTime()
+			-- Keep buying: take what you just bought off the listings we already know about,
+			-- so your very next click can buy the rest without waiting for a new search.
+			-- (Every buy is still price-checked first, so stale info can never overspend.)
+			local id = pending.itemID
+			local r = results[id]
+			local more = 0
+			if cfg and r and r.under then
+				local left = pending.qty
+				for _, l in ipairs(r.under) do
+					local used = math.min(l.qty, left)
+					l.qty = l.qty - used
+					left = left - used
+					if left <= 0 then break end
+				end
+				r.avail, r.total = Fill(cfg, r.under, r.typo)
+				more = r.avail
+				-- Same for the listings table on the Focus page, so it doesn't show what you just bought.
+				left = pending.qty
+				for _, l in ipairs(r.listings or {}) do
+					if l.price <= (cfg.max or 0) then
+						local used = math.min(math.max(0, l.qty), left)
+						l.qty = l.qty - used
+						left = left - used
+						if left <= 0 then break end
+					end
+				end
 			else
-				SetStatus("Bought! Watching for more...", 0.3, 1, 0.3)
+				results[id] = nil
 			end
-			results[pending.itemID] = nil
-			priorityID = pending.itemID -- check for more right away
+			if cfg and db.countdown and Remaining(cfg) == 0 then
+				SetStatus(("Got all %d %s. Count down done."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
+			elseif more > 0 then
+				SetStatus(("Bought %d! %d more under your max: click again."):format(pending.qty, more), 0.3, 1, 0.3)
+			else
+				SetStatus(("Bought %d! Watching for more..."):format(pending.qty), 0.3, 1, 0.3)
+			end
+			-- Nothing left to buy: search again right away. More left: keep the line free for
+			-- your next click (the listings refresh on the slower deal pace instead).
+			if more == 0 then priorityID = id end
 			pending = nil
 			HS.Refresh()
 		end

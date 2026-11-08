@@ -2,7 +2,7 @@
 
 A small World of Warcraft **Forever** addon for buying auction house materials fast: cloth, dye, herbs, anything sold by quantity.
 
-You set a max price and a quantity. The addon searches the auction house on its own and tells you the moment something is listed at or under your price. Then you press BUY once: the addon gets the exact price and buys straight away if it's still at or under your max. If someone beats you and the price comes back higher, it cancels automatically, so you never pay more than your max. Spamming the button is safe.
+You set a max price and how many you want. The addon searches the auction house on its own and shows a big **YES** the moment something is listed at or under your price. Click BUY: the addon gets the exact price and buys straight away if it's still at or under your max. Keep clicking to keep buying; it doesn't wait for a new search between buys. If someone beats you and the price comes back higher, it cancels automatically, so you never pay more than your max.
 
 It doesn't need TSM or any other addon.
 
@@ -17,18 +17,25 @@ It doesn't need TSM or any other addon.
 
 The window opens when you open the auction house.
 
-- **Focus** (main mode): drop in one item, set your max price and quantity. Only that item is searched, as fast as the game allows (every 0.6s). You see the cheapest listings live.
-  - **Count down** (optional): tick it and your quantity becomes a hard limit. Buy 7 of 20 and it only goes for 13 more, then stops. It starts over after 5 minutes without buying (change that in Settings), or click Reset. Leave it off to buy up to your quantity every time, for as long as you keep pressing.
+- **Focus** (main mode): drop in one item, set your max price and how many. Only that item is searched, as fast as the game allows (every 0.6s). A big line tells you YES (buy now) or NO, and the 6 cheapest listings show underneath.
+  - **Count down** (on by default): "Total" is a hard limit. Buy 7 of 20 and it only goes for 13 more, then stops however much you click. It starts over after 5 minutes without buying (change that in Settings), or click Reset. Untick it to buy up to your amount on every click, for as long as you keep clicking.
 - **Snipe**: watch several items at once; they take turns being searched.
-- **Watch List**: add items, set prices and quantities, tick items on or off.
-- **Settings**: gold to always keep, an extra confirm for big buys, search speed, sound, one-press buying.
+- **Watch List**: add items, set prices and amounts, tick items on or off.
+- **Settings**: never spend below a gold amount, search speed, sound, buy in one click, count down reset time.
 - **History**: what you bought and how much you spent today.
 
-**Buying:** click the big BUY button, or set a key: Esc → Options → Keybindings → AddOns → Helpme Sniper. Buys over your "extra confirm" amount (2g by default) need **Shift + click**, so spamming can't confirm a big buy by accident.
+**Buying:** spam-click the big BUY button, or set a key: Esc → Options → Keybindings → AddOns → Helpme Sniper.
+
+**Safety, without pop-ups:**
+- Your max price per item: it never pays more on average.
+- Typo guard: if your max is more than double the usual price (say 20g instead of 20c), it warns you as you type and won't buy until you click "I meant it".
+- "Never spend below": your gold never drops under this amount.
+- Count down: never buys more than your total.
 
 ## Good to know
 
-- The game needs a real key press or click to start each purchase, so the addon never buys without you pressing. If the game ever refuses the automatic last step, the addon switches to "press again to buy" by itself.
+- The game needs a real click or key press to start each purchase, so the addon never buys without you clicking. If the game ever refuses the automatic last step, the addon switches to "click again to buy" by itself.
+- The window is locked in place by default so fast clicking can't drag it. Unlock it in Settings to move it.
 - WoW allows about 100 auction searches per minute across all addons combined. Running TSM's Sniper at the same time slows both down.
 - Only works for items sold by quantity, not gear or bags.
 
