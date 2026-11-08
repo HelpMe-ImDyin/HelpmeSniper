@@ -1,12 +1,12 @@
--- Helpme Sniper v0.5
+-- Helpme Sniper v0.6
 -- Personal quick-buy sniper for stackable auction house items (cloth, dye, herbs).
 -- Standalone: scans the auction house itself, no other addons needed.
 --
 -- Tabs:
 --   Focus      one item, searched as fast as the game allows, live listings
---   Snipe      the whole watch list takes turns being searched
---   Watch List add items (drag / shift-click / item ID), set max price, quantity, on/off
---   Settings   gold to keep, search speed, one-press buying, count down reset time
+--   Watch List several items: add them, set max price and amount, tick on/off; ticked items
+--              take turns being searched and each row shows the live deal
+--   Settings   Safety (never spend below, one-click buying, count down reset) and Other
 --   History    what you bought and how much you spent today
 --
 -- Buying: one press of the buy key asks the auction house for the exact price (the game
@@ -25,7 +25,7 @@ BINDING_NAME_HELPMESNIPER_BUY = "Buy (one press; safe to spam)"
 
 -- Prices are stored in copper (100 copper = 1 silver, 10000 copper = 1 gold).
 local DEFAULTS = {
-	version = 5,
+	version = 6,
 	interval = 0.6,
 	autoStart = true,
 	sound = true,
@@ -96,6 +96,19 @@ local function Money(c)
 	if g > 0 then parts[#parts + 1] = g .. "|cffffd700g|r" end
 	if s > 0 then parts[#parts + 1] = s .. "|cffc7c7cfs|r" end
 	if cp > 0 or #parts == 0 then parts[#parts + 1] = cp .. "|cffeda55fc|r" end
+	return table.concat(parts, " ")
+end
+
+-- Same as Money but without the gold/silver/copper colors, for text that has its own color.
+local function MoneyPlain(c)
+	c = math.floor((c or 0) + 0.5)
+	local g = math.floor(c / 10000)
+	local s = math.floor((c % 10000) / 100)
+	local cp = c % 100
+	local parts = {}
+	if g > 0 then parts[#parts + 1] = g .. "g" end
+	if s > 0 then parts[#parts + 1] = s .. "s" end
+	if cp > 0 or #parts == 0 then parts[#parts + 1] = cp .. "c" end
 	return table.concat(parts, " ")
 end
 
@@ -585,6 +598,24 @@ local function Check(parent, label, x, y, onClick)
 	return cb
 end
 
+-- A small hover tip.
+local function Tip(frame, text)
+	frame:HookScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_TOP")
+		GameTooltip:SetText(text, 1, 1, 1)
+		GameTooltip:Show()
+	end)
+	frame:HookScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
+-- The small "Live" / "Paused" marker: a colored square plus a word.
+local function LiveText()
+	if scanning then
+		return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:51:255:51|t |cff33ff33Live|r"
+	end
+	return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:255:136:51|t |cffff8833Paused - click Start|r"
+end
+
 local function NumberBox(parent, x, y, w, maxLetters)
 	local eb = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
 	eb:SetSize(w, 18)
@@ -651,13 +682,14 @@ end
 -- Window
 -- ============================================================================
 
-local TABS = { { key = "focus", label = "Focus" }, { key = "snipe", label = "Snipe" }, { key = "watch", label = "Watch List" }, { key = "settings", label = "Settings" }, { key = "history", label = "History" } }
+local TABS = { { key = "focus", label = "Focus" }, { key = "watch", label = "Watch List" }, { key = "settings", label = "Settings" }, { key = "history", label = "History" } }
 
 function HS.ShowTab(key)
+	if not ui.panels[key] then key = "focus" end
 	db.tab = key
 	if key == "focus" then
 		db.mode = "focus"
-	elseif key == "snipe" then
+	elseif key == "watch" then
 		db.mode = "all"
 	end
 	HS.UpdateMode()
@@ -667,41 +699,6 @@ function HS.ShowTab(key)
 		if t.key == key then ui.tabs[t.key]:LockHighlight() else ui.tabs[t.key]:UnlockHighlight() end
 	end
 	HS.Refresh()
-end
-
-local function BuildSnipePanel(p)
-	ui.scanLine = Text(p, "GameFontHighlightSmall", 2, -6, 450)
-
-	Text(p, "GameFontNormalSmall", 4, -30, 150):SetText("Item")
-	Text(p, "GameFontNormalSmall", 156, -30, 62, "RIGHT"):SetText("Deal qty")
-	Text(p, "GameFontNormalSmall", 220, -30, 76, "RIGHT"):SetText("Avg price")
-	Text(p, "GameFontNormalSmall", 298, -30, 66, "RIGHT"):SetText("Your max")
-	Text(p, "GameFontNormalSmall", 366, -30, 86, "RIGHT"):SetText("Typical")
-
-	ui.snipeRows = {}
-	for i = 1, MAX_ITEMS do
-		local b = CreateFrame("Button", nil, p)
-		b:SetSize(452, 18)
-		b:SetPoint("TOPLEFT", 0, -46 - (i - 1) * 19)
-		b.hl = b:CreateTexture(nil, "BACKGROUND")
-		b.hl:SetAllPoints()
-		b.hl:SetColorTexture(0.2, 0.55, 0.2, 0.35)
-		b.hl:Hide()
-		b.name = Text(b, nil, 4, -3, 150)
-		b.qty = Text(b, nil, 156, -3, 62, "RIGHT")
-		b.avg = Text(b, nil, 220, -3, 76, "RIGHT")
-		b.max = Text(b, nil, 298, -3, 66, "RIGHT")
-		b.typ = Text(b, nil, 366, -3, 86, "RIGHT")
-		b:SetScript("OnClick", function(self)
-			if self.itemID then
-				selected = self.itemID
-				HS.Refresh()
-			end
-		end)
-		ui.snipeRows[i] = b
-	end
-	local note = Text(p, "GameFontDisableSmall", 2, -210, 450)
-	note:SetText("All ticked items take turns. Click a row to choose which one the buy key buys.")
 end
 
 local function BuildWatchPanel(p)
@@ -737,23 +734,27 @@ local function BuildWatchPanel(p)
 		if id then HS.AddItem(id) else Print("Couldn't read an item from that. Shift-click an item or type its ID.") end
 	end)
 	ui.addBox:SetScript("OnReceiveDrag", AddFromCursor)
-	Text(p, "GameFontDisableSmall", 350, -8, 104):SetText("max " .. MAX_ITEMS .. " items")
+	ui.watchLive = Text(p, "GameFontHighlightSmall", 350, -8, 104, "RIGHT")
 
-	Text(p, "GameFontNormalSmall", 0, -32, 24):SetText("On")
-	Text(p, "GameFontNormalSmall", 26, -32, 110):SetText("Item (click to edit)")
-	Text(p, "GameFontNormalSmall", 146, -32, 130):SetText("Max price each")
-	Text(p, "GameFontNormalSmall", 286, -32, 80):SetText("Quantity")
-	Text(p, "GameFontNormalSmall", 400, -32, 54, "RIGHT"):SetText("Remove")
+	Text(p, "GameFontNormalSmall", 0, -30, 24):SetText("On")
+	Text(p, "GameFontNormalSmall", 26, -30, 98):SetText("Item")
+	Text(p, "GameFontNormalSmall", 132, -30, 120):SetText("Max price each")
+	Text(p, "GameFontNormalSmall", 266, -30, 76, "CENTER"):SetText("Amount")
+	Text(p, "GameFontNormalSmall", 346, -30, 84, "RIGHT"):SetText("Now")
 
 	ui.watchRows = {}
 	for i = 1, MAX_ITEMS do
 		local row = CreateFrame("Frame", nil, p)
 		row:SetSize(456, 20)
 		row:SetPoint("TOPLEFT", 0, -46 - (i - 1) * 21)
-		row.sel = row:CreateTexture(nil, "BACKGROUND")
+		row.sel = row:CreateTexture(nil, "BACKGROUND") -- the item you clicked
 		row.sel:SetAllPoints()
 		row.sel:SetColorTexture(0.25, 0.4, 0.7, 0.3)
 		row.sel:Hide()
+		row.hl = row:CreateTexture(nil, "BACKGROUND") -- the item the BUY button will buy
+		row.hl:SetAllPoints()
+		row.hl:SetColorTexture(0.2, 0.55, 0.2, 0.35)
+		row.hl:Hide()
 
 		row.on = Check(row, nil, 0, 0, function(self)
 			local cfg = row.itemID and db.items[row.itemID]
@@ -765,15 +766,16 @@ local function BuildWatchPanel(p)
 		end)
 
 		row.nameBtn = CreateFrame("Button", nil, row)
-		row.nameBtn:SetSize(112, 20)
-		row.nameBtn:SetPoint("TOPLEFT", 26, 0)
-		row.name = Text(row.nameBtn, nil, 0, -4, 112)
+		row.nameBtn:SetSize(100, 20)
+		row.nameBtn:SetPoint("TOPLEFT", 24, 0)
+		row.name = Text(row.nameBtn, nil, 0, -4, 100)
 		row.nameBtn:SetScript("OnClick", function()
-			editID = row.itemID
+			editID = row.itemID -- show its prices below
+			selected = row.itemID -- and make it the one BUY buys when it has a deal
 			HS.Refresh()
 		end)
 
-		row.money = MoneyBoxes(row, 140, -1, function(copper)
+		row.money = MoneyBoxes(row, 126, -1, function(copper)
 			local cfg = row.itemID and db.items[row.itemID]
 			if cfg then
 				cfg.max = copper
@@ -783,14 +785,15 @@ local function BuildWatchPanel(p)
 			HS.Refresh()
 		end)
 
-		row.minus = Button(row, "-", 286, 0, 20, 20, function()
+		row.minus = Button(row, "-", 266, 0, 20, 20, function()
 			local cfg = row.itemID and db.items[row.itemID]
 			if cfg then
 				cfg.qty = math.max(1, cfg.qty - (IsShiftKeyDown() and 10 or 1))
 				HS.Refresh()
 			end
 		end)
-		row.qty = NumberBox(row, 304, -1, 34, 4)
+		Tip(row.minus, "Shift-click: 10 at a time")
+		row.qty = NumberBox(row, 284, -1, 30, 4)
 		row.qty:SetJustifyH("CENTER")
 		row.qty:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
 		row.qty:SetScript("OnEditFocusLost", function(self)
@@ -799,17 +802,21 @@ local function BuildWatchPanel(p)
 			if cfg and v and v >= 1 then cfg.qty = math.floor(v) end
 			HS.Refresh()
 		end)
-		row.plus = Button(row, "+", 346, 0, 20, 20, function()
+		row.plus = Button(row, "+", 322, 0, 20, 20, function()
 			local cfg = row.itemID and db.items[row.itemID]
 			if cfg then
 				cfg.qty = cfg.qty + (IsShiftKeyDown() and 10 or 1)
 				HS.Refresh()
 			end
 		end)
+		Tip(row.plus, "Shift-click: 10 at a time")
 
-		row.del = Button(row, "X", 432, 0, 22, 20, function()
+		row.now = Text(row, nil, 346, -4, 84, "RIGHT")
+
+		row.del = Button(row, "X", 434, 0, 22, 20, function()
 			if row.itemID then StaticPopup_Show("HELPMESNIPER_REMOVE", ItemName(row.itemID), nil, row.itemID) end
 		end)
+		Tip(row.del, "Stop watching this item")
 		ui.watchRows[i] = row
 	end
 
@@ -829,54 +836,56 @@ local function BuildWatchPanel(p)
 			end
 		end)
 	end
-	Text(p, "GameFontDisableSmall", 344, -247, 110):SetText("Shift +/- = 10")
 end
 
 local function BuildSettingsPanel(p)
-	Text(p, "GameFontNormalSmall", 2, -8, 220):SetText("Never spend below:")
-	ui.reserve = MoneyBoxes(p, 230, -4, function(copper)
+	-- Safety: what stops you spending more than you mean to
+	Text(p, "GameFontNormal", 2, -2, 200):SetText("Safety")
+	Text(p, "GameFontNormalSmall", 2, -24, 220):SetText("Never spend below:")
+	ui.reserve = MoneyBoxes(p, 230, -20, function(copper)
 		db.reserve = copper
 		HS.Refresh()
 	end)
-	Text(p, "GameFontNormalSmall", 2, -36, 220):SetText("Search every (seconds):")
-	Button(p, "-", 236, -32, 22, 20, function()
-		db.interval = math.max(MIN_INTERVAL, math.floor((db.interval - 0.1) * 10 + 0.5) / 10)
-		HS.Refresh()
-	end)
-	ui.speedText = Text(p, "GameFontHighlight", 262, -35, 40, "CENTER")
-	Button(p, "+", 306, -32, 22, 20, function()
-		db.interval = math.min(MAX_INTERVAL, math.floor((db.interval + 0.1) * 10 + 0.5) / 10)
-		HS.Refresh()
-	end)
-	ui.speedNote = Text(p, "GameFontDisableSmall", 2, -56, 450)
-
-	ui.soundCheck = Check(p, "Play a sound when a deal appears", 0, -78, function(self) db.sound = self:GetChecked() and true or false end)
-	ui.autoCheck = Check(p, "Start searching when the auction house opens", 0, -100, function(self) db.autoStart = self:GetChecked() and true or false end)
-	ui.lockCheck = Check(p, "Lock window position", 0, -122, function(self) db.locked = self:GetChecked() and true or false end)
-	ui.autoBuyCheck = Check(p, "Buy in one click (gets the price and buys)", 0, -144, function(self)
+	ui.autoBuyCheck = Check(p, "Buy in one click (gets the price and buys)", 0, -42, function(self)
 		db.autoBuy = self:GetChecked() and true or false
 		db.autoBuyBlocked = nil -- ticking it again lets the addon retry
 		HS.Refresh()
 	end)
-	ui.autoBuyNote = Text(p, "GameFontDisableSmall", 296, -149, 160)
-
-	Text(p, "GameFontNormalSmall", 2, -172, 230):SetText("Count down resets after no buys for:")
-	Button(p, "-", 236, -168, 22, 20, function()
+	ui.autoBuyNote = Text(p, "GameFontDisableSmall", 296, -47, 160)
+	Text(p, "GameFontNormalSmall", 2, -68, 230):SetText("Count down resets after no buys for:")
+	Button(p, "-", 236, -64, 22, 20, function()
 		db.resetMinutes = math.max(1, (db.resetMinutes or 5) - 1)
 		HS.Refresh()
 	end)
-	ui.resetText = Text(p, "GameFontHighlight", 262, -171, 40, "CENTER")
-	Button(p, "+", 306, -168, 22, 20, function()
+	ui.resetText = Text(p, "GameFontHighlight", 262, -67, 40, "CENTER")
+	Button(p, "+", 306, -64, 22, 20, function()
 		db.resetMinutes = math.min(120, (db.resetMinutes or 5) + 1)
 		HS.Refresh()
 	end)
-	Text(p, "GameFontHighlightSmall", 334, -172, 60):SetText("minutes")
+	Text(p, "GameFontHighlightSmall", 334, -68, 60):SetText("minutes")
+
+	-- Other
+	Text(p, "GameFontNormal", 2, -94, 200):SetText("Other")
+	Text(p, "GameFontNormalSmall", 2, -116, 220):SetText("Search every (seconds):")
+	Button(p, "-", 236, -112, 22, 20, function()
+		db.interval = math.max(MIN_INTERVAL, math.floor((db.interval - 0.1) * 10 + 0.5) / 10)
+		HS.Refresh()
+	end)
+	ui.speedText = Text(p, "GameFontHighlight", 262, -115, 40, "CENTER")
+	Button(p, "+", 306, -112, 22, 20, function()
+		db.interval = math.min(MAX_INTERVAL, math.floor((db.interval + 0.1) * 10 + 0.5) / 10)
+		HS.Refresh()
+	end)
+	ui.speedNote = Text(p, "GameFontDisableSmall", 2, -134, 450)
+	ui.soundCheck = Check(p, "Play a sound when a deal appears", 0, -150, function(self) db.sound = self:GetChecked() and true or false end)
+	ui.autoCheck = Check(p, "Start searching when the auction house opens", 0, -172, function(self) db.autoStart = self:GetChecked() and true or false end)
+	ui.lockCheck = Check(p, "Lock window position", 0, -194, function(self) db.locked = self:GetChecked() and true or false end)
 
 	local help = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	help:SetPoint("TOPLEFT", 2, -200)
+	help:SetPoint("TOPLEFT", 2, -222)
 	help:SetWidth(450)
 	help:SetJustifyH("LEFT")
-	help:SetText("Spam-click the BUY button, or set a key: Esc > Options > Keybindings > AddOns > Helpme Sniper.\nTypo guard: it won't buy if your max is more than double the usual price, until you click \"I meant it\".\nOther auction addons scanning at the same time slow this down.")
+	help:SetText("Set a buy key: Esc > Options > Keybindings > AddOns > Helpme Sniper.\nOther auction addons searching at the same time slow this down.")
 end
 
 local function BuildHistoryPanel(p)
@@ -957,8 +966,9 @@ local function BuildFocusPanel(p)
 		HS.Refresh()
 	end)
 	ui.fQtyLabel = Text(b, "GameFontNormalSmall", 244, -78, 56)
-	Button(b, "-", 300, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and -10 or -1) end)
+	Tip(Button(b, "-", 300, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and -10 or -1) end), "Shift-click: 10 at a time")
 	ui.fQty = NumberBox(b, 320, -75, 40, 4)
+	Tip(ui.fQty, "Type an amount, or use - and +\nShift-click - or + to change it by 10")
 	ui.fQty:SetJustifyH("CENTER")
 	ui.fQty:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
 	ui.fQty:SetScript("OnEditFocusLost", function(self)
@@ -967,9 +977,7 @@ local function BuildFocusPanel(p)
 		if cfg and v and v >= 1 then cfg.qty = math.floor(v) end
 		HS.Refresh()
 	end)
-	Button(b, "+", 372, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and 10 or 1) end)
-	ui.fShiftHint = Text(b, "GameFontDisableSmall", 398, -78, 58)
-	ui.fShiftHint:SetText("Shift = 10")
+	Tip(Button(b, "+", 372, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and 10 or 1) end), "Shift-click: 10 at a time")
 	ui.fReset = Button(b, "Reset", 398, -74, 54, 20, function()
 		local cfg = db.focusItem and db.items[db.focusItem]
 		if cfg then
@@ -1081,7 +1089,7 @@ local function BuildFrame()
 
 	ui.tabs, ui.panels = {}, {}
 	for i, t in ipairs(TABS) do
-		ui.tabs[t.key] = Button(f, t.label, 8 + (i - 1) * 91, -32, 88, 22, function() HS.ShowTab(t.key) end)
+		ui.tabs[t.key] = Button(f, t.label, 8 + (i - 1) * 115, -32, 110, 22, function() HS.ShowTab(t.key) end)
 		local p = CreateFrame("Frame", nil, f)
 		p:SetPoint("TOPLEFT", 8, -60)
 		p:SetPoint("BOTTOMRIGHT", -8, 76)
@@ -1089,7 +1097,6 @@ local function BuildFrame()
 		ui.panels[t.key] = p
 	end
 	BuildFocusPanel(ui.panels.focus)
-	BuildSnipePanel(ui.panels.snipe)
 	BuildWatchPanel(ui.panels.watch)
 	BuildSettingsPanel(ui.panels.settings)
 	BuildHistoryPanel(ui.panels.history)
@@ -1104,92 +1111,92 @@ local function BuildFrame()
 	ui.buyBtn:SetSize(456, 34)
 	ui.buyBtn:SetPoint("BOTTOM", 0, 8)
 	ui.buyBtn:SetScript("OnClick", function() HelpmeSniper_BuyStep() end)
+	-- A see-through color laid over the button: green = will buy, yellow = busy, grey = nothing to buy.
+	ui.buyTint = ui.buyBtn:CreateTexture(nil, "ARTWORK")
+	ui.buyTint:SetPoint("TOPLEFT", 3, -3)
+	ui.buyTint:SetPoint("BOTTOMRIGHT", -3, 3)
 end
 
 -- ============================================================================
 -- Refresh (redraws whatever is on screen)
 -- ============================================================================
 
-local function TypicalText(id)
-	local typ, n = Typical(id)
-	if typ then return Money(typ) end
-	return "|cff888888learning " .. n .. "/" .. MIN_SAMPLES .. "|r"
-end
-
-local function RefreshSnipe()
-	if focusID then
-		ui.scanLine:SetText((scanning and "|cff33ff33Scanning|r" or "|cffff8833Paused|r") .. "  |cffffd100Focus: " .. ItemName(focusID) .. "|r")
-	else
-		ui.scanLine:SetText((scanning and "|cff33ff33Scanning|r" or "|cffff8833Paused|r") .. "   Gold " .. Money(GetMoney()) .. "  (never below " .. Money(db.reserve) .. ")")
-	end
-
-	local target = Target()
-	local i = 1
-	for _, id in ipairs(db.order) do
-		local cfg = db.items[id]
-		local r = results[id]
-		local row = ui.snipeRows[i]
-		row.itemID = id
-		row:Show()
-		row.name:SetText(ItemName(id))
-		row.max:SetText(cfg.max > 0 and Money(cfg.max) or "|cffff5555set price|r")
-		row.typ:SetText(TypicalText(id))
-		if cfg.enabled == false then
-			row.qty:SetText("|cff888888paused|r")
-			row.avg:SetText("")
-			row.name:SetTextColor(0.45, 0.45, 0.45)
-		elseif r and r.typo then
-			row.qty:SetText("|cffff5555typo?|r")
-			row.avg:SetText("|cffff5555max > 2x usual|r")
-			row.name:SetTextColor(1, 0.35, 0.35)
-		elseif r and r.avail > 0 then
-			row.qty:SetText(r.avail .. "/" .. Remaining(cfg))
-			row.avg:SetText(Money(r.total / r.avail))
-			row.name:SetTextColor(0.3, 1, 0.3)
-		else
-			row.qty:SetText("-")
-			row.avg:SetText(r and r.cheapest and ("low " .. Money(r.cheapest)) or "-")
-			row.name:SetTextColor(focusID and focusID ~= id and 0.45 or 0.8, focusID and focusID ~= id and 0.45 or 0.8, focusID and focusID ~= id and 0.45 or 0.8)
-		end
-		row.hl:SetShown(target == id)
-		i = i + 1
-	end
-	for j = i, MAX_ITEMS do
-		ui.snipeRows[j].itemID = nil
-		ui.snipeRows[j]:Hide()
-	end
-
+-- Sets the BUY button's words and color in one go.
+local function SetBuy(text, r, g, b, tintAlpha)
+	ui.buyBtn:SetText(("|cff%02x%02x%02x%s|r"):format(math.floor(r * 255), math.floor(g * 255), math.floor(b * 255), text))
+	ui.buyTint:SetColorTexture(r, g, b, tintAlpha or 0.3)
 end
 
 local function RefreshBuy()
 	ui.startBtn:SetText(scanning and "Stop" or "Start")
 	local target = Target()
 	if pending and pending.stage == "ready" then
-		ui.buyBtn:SetText("PRESS AGAIN: buy " .. pending.qty .. " for " .. Money(pending.quote))
+		SetBuy(("CLICK AGAIN: buy %d %s for %s"):format(pending.qty, ItemName(pending.itemID), MoneyPlain(pending.quote)), 0.3, 1, 0.3)
 	elseif pending and pending.stage == "buying" then
-		ui.buyBtn:SetText("Buying " .. pending.qty .. "...")
+		SetBuy(("Buying %d %s..."):format(pending.qty, ItemName(pending.itemID)), 1, 0.82, 0)
 	elseif pending then
-		ui.buyBtn:SetText("Getting price...")
+		SetBuy(("Getting price for %d %s..."):format(pending.qty, ItemName(pending.itemID)), 1, 0.82, 0)
 	elseif target then
-		ui.buyBtn:SetText("BUY " .. results[target].avail .. " " .. ItemName(target))
+		local r, cfg = results[target], db.items[target]
+		SetBuy(("BUY %d %s · %s each (max %s)"):format(r.avail, ItemName(target), MoneyPlain(r.total / r.avail), MoneyPlain(cfg.max)), 0.3, 1, 0.3)
 	else
-		ui.buyBtn:SetText("BUY (no deals yet)")
+		-- Nothing to buy: on the Focus tab, say why if it's something you can fix.
+		local id = db.mode == "focus" and db.focusItem
+		local cfg = id and db.items[id]
+		local r = id and results[id]
+		if cfg and r and r.typo then
+			SetBuy("Check your max price (typo?)", 1, 0.35, 0.35)
+		elseif cfg and db.countdown and (cfg.max or 0) > 0 and Remaining(cfg) == 0 then
+			SetBuy(("Done: bought all %d. Reset to buy more"):format(cfg.qty), 0.6, 0.6, 0.6, 0.12)
+		else
+			SetBuy("BUY · no deal right now", 0.6, 0.6, 0.6, 0.12)
+		end
 	end
 end
 
 local function RefreshWatch()
+	ui.watchLive:SetText(LiveText())
+	local target = Target()
 	local i = 1
 	for _, id in ipairs(db.order) do
 		local cfg = db.items[id]
+		local r = results[id]
 		local row = ui.watchRows[i]
 		row.itemID = id
 		row:Show()
-		row.on:SetChecked(cfg.enabled ~= false)
+		local on = cfg.enabled ~= false
+		row.on:SetChecked(on)
 		row.name:SetText(ItemName(id))
-		row.name:SetTextColor(cfg.enabled == false and 0.5 or 1, cfg.enabled == false and 0.5 or 1, cfg.enabled == false and 0.5 or 1)
 		row.money.Set(cfg.max)
 		if not row.qty:HasFocus() then row.qty:SetText(tostring(cfg.qty)) end
-		row.sel:SetShown(editID == id)
+		-- The "Now" column: what's happening with this item right now.
+		if not on then
+			row.now:SetText("|cff888888off|r")
+			row.name:SetTextColor(0.5, 0.5, 0.5)
+		elseif (cfg.max or 0) <= 0 then
+			row.now:SetText("|cffff5555set max|r")
+			row.name:SetTextColor(1, 1, 1)
+		elseif r and r.typo then
+			row.now:SetText("|cffff5555typo?|r")
+			row.name:SetTextColor(1, 0.35, 0.35)
+		elseif db.countdown and Remaining(cfg) == 0 then
+			row.now:SetText("|cffffd100done|r")
+			row.name:SetTextColor(1, 1, 1)
+		elseif r and r.avail > 0 then
+			row.now:SetText("|cff33ff33YES " .. r.avail .. "|r")
+			row.name:SetTextColor(0.3, 1, 0.3)
+		elseif r and r.cheapest then
+			row.now:SetText(Money(r.cheapest))
+			row.name:SetTextColor(1, 1, 1)
+		elseif r then
+			row.now:SetText("|cff888888none listed|r")
+			row.name:SetTextColor(1, 1, 1)
+		else
+			row.now:SetText("|cff888888...|r")
+			row.name:SetTextColor(1, 1, 1)
+		end
+		row.hl:SetShown(on and target == id)
+		row.sel:SetShown(editID == id and target ~= id)
 		i = i + 1
 	end
 	for j = i, MAX_ITEMS do
@@ -1209,7 +1216,7 @@ local function RefreshWatch()
 			(r and r.cheapest) and Money(r.cheapest) or "-"))
 		for _, b in ipairs(ui.pctBtns) do b:SetEnabled(typ ~= nil) end
 	else
-		ui.editInfo:SetText("|cff888888Click an item name to see its prices and quick-set buttons.|r")
+		ui.editInfo:SetText("|cff888888Ticked items take turns. Click a name to see its prices and buy that one first.|r")
 		for _, b in ipairs(ui.pctBtns) do b:SetEnabled(false) end
 	end
 end
@@ -1221,7 +1228,7 @@ local function RefreshSettings()
 	for _, id in ipairs(db.order) do
 		if db.items[id] and db.items[id].enabled ~= false then active = active + 1 end
 	end
-	ui.speedNote:SetText(("Focus tab: your one item is checked every %.1fs. Snipe tab: %d items take turns, each about every %.1fs."):format(db.interval, active, db.interval * math.max(1, active)))
+	ui.speedNote:SetText(("Focus: your one item is checked every %.1fs. Watch List: %d items take turns, each about every %.1fs."):format(db.interval, active, db.interval * math.max(1, active)))
 	ui.soundCheck:SetChecked(db.sound)
 	ui.autoCheck:SetChecked(db.autoStart)
 	ui.lockCheck:SetChecked(db.locked)
@@ -1266,7 +1273,6 @@ local function RefreshFocus()
 	if not ui.fQty:HasFocus() then ui.fQty:SetText(tostring(cfg.qty)) end
 	ui.fCount:SetChecked(db.countdown)
 	ui.fReset:SetShown(db.countdown)
-	ui.fShiftHint:SetShown(not db.countdown)
 	ui.fQtyLabel:SetText(db.countdown and "Total:" or "Per buy:")
 	local left = Remaining(cfg)
 	if db.countdown then
@@ -1341,8 +1347,8 @@ function HS.UpdateAge(now)
 	local id = db.focusItem
 	if not id then return end
 	local r = results[id]
-	local state = scanning and ("|cff33ff33Searching every " .. ("%.1f"):format(db.interval) .. "s|r") or "|cffff8833Paused - click Start|r"
-	if r and r.time then state = state .. ("     last update %.1fs ago"):format(now - r.time) end
+	local state = LiveText()
+	if r and r.time then state = state .. ("     |cffaaaaaaupdated %.1fs ago|r"):format(now - r.time) end
 	ui.fAge:SetText(state)
 end
 
@@ -1350,7 +1356,6 @@ function HS.Refresh()
 	if not ui.frame or not db then return end
 	RefreshBuy()
 	if ui.panels.focus:IsShown() then RefreshFocus() end
-	if ui.panels.snipe:IsShown() then RefreshSnipe() end
 	if ui.panels.watch:IsShown() then RefreshWatch() end
 	if ui.panels.settings:IsShown() then RefreshSettings() end
 	if ui.panels.history:IsShown() then RefreshHistory() end
@@ -1413,6 +1418,11 @@ local function InitDB()
 		db.maxSpend = nil
 		db.version = 5
 	end
+	if db.version < 6 then
+		-- v0.6: the Snipe tab is now part of the Watch List tab
+		if db.tab == "snipe" then db.tab = "watch" end
+		db.version = 6
+	end
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
 	end
@@ -1449,7 +1459,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		results = {}
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
-		HS.ShowTab(db.tab or "snipe")
+		HS.ShowTab(db.tab or "focus")
 		SetStatus(scanning and "Scanning..." or "Paused. Click Start.", 0.8, 0.8, 0.8)
 
 	elseif event == "AUCTION_HOUSE_CLOSED" then

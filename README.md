@@ -19,12 +19,16 @@ The window opens when you open the auction house.
 
 - **Focus** (main mode): drop in one item, set your max price and how many. Only that item is searched, as fast as the game allows (every 0.6s). A big line tells you YES (buy now) or NO, and the 6 cheapest listings show underneath.
   - **Count down** (on by default): "Total" is a hard limit. Buy 7 of 20 and it only goes for 13 more, then stops however much you click. It starts over after 5 minutes without buying (change that in Settings), or click Reset. Untick it to buy up to your amount on every click, for as long as you keep clicking.
-- **Snipe**: watch several items at once; they take turns being searched.
-- **Watch List**: add items, set prices and amounts, tick items on or off.
-- **Settings**: never spend below a gold amount, search speed, sound, buy in one click, count down reset time.
+- **Watch List**: several items at once. Add items, set a max price and amount for each, and tick the ones to search; they take turns. The "Now" column shows YES when there's a deal, otherwise the cheapest price. Click a name to see its prices and buy that one first.
+- **Settings**: *Safety* (never spend below a gold amount, buy in one click, count down reset time) and *Other* (search speed, sound, auto-start, lock window).
 - **History**: what you bought and how much you spent today.
 
-**Buying:** spam-click the big BUY button, or set a key: Esc → Options → Keybindings → AddOns → Helpme Sniper.
+**Buying:** spam-click the big BUY button, or set a key: Esc → Options → Keybindings → AddOns → Helpme Sniper. The button tells you what it will do and changes color:
+- **Green:** clicking buys, e.g. "BUY 7 Wool Cloth · 9s each (max 10s)".
+- **Yellow:** busy getting the price or buying. Keep clicking.
+- **Grey:** nothing at your price right now.
+
+Shift-click the - and + buttons to change the amount by 10.
 
 **Safety, without pop-ups:**
 - Your max price per item: it never pays more on average.
