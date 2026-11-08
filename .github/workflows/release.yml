@@ -27,5 +27,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "build/HelpmeSniper-${GITHUB_REF_NAME}-forever.zip" \
-            --title "Helpme Sniper $GITHUB_REF_NAME" --generate-notes
+          ZIP="build/HelpmeSniper-${GITHUB_REF_NAME}-forever.zip"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            # Release already exists (re-run): just replace the zip.
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ZIP" --title "Helpme Sniper $GITHUB_REF_NAME" --generate-notes
+          fi
