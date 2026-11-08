@@ -1,13 +1,14 @@
--- Helpme Sniper v0.6.2
+-- Helpme Sniper v0.7
 -- Personal quick-buy sniper for stackable auction house items (cloth, dye, herbs).
 -- Standalone: scans the auction house itself, no other addons needed.
 --
 -- Tabs:
---   Focus      one item, searched as fast as the game allows, live listings
---   Watch List several items: add them, set max price and amount, tick on/off; ticked items
---              take turns being searched and each row shows the live deal
---   Settings   Safety (never spend below, one-click buying, count down reset) and Other
---   History    what you bought and how much you spent today
+--   Focus          one item, searched as fast as the game allows, live listings
+--   Shopping List  named lists of items you need; deals are a % of the normal price (or a
+--                  fixed price); "Track totals" counts what you buy until you mark the list
+--                  complete; completed lists keep a receipt and can be shopped again
+--   Settings       Safety (never spend below, one-click buying, count down reset) and Other
+--   History        what you bought and how much you spent today
 --
 -- Buying: one press of the buy key asks the auction house for the exact price (the game
 -- requires a real key press for that). When the price comes back at or under your max, the
@@ -25,28 +26,27 @@ BINDING_NAME_HELPMESNIPER_BUY = "Buy (one press; safe to spam)"
 
 -- Prices are stored in copper (100 copper = 1 silver, 10000 copper = 1 gold).
 local DEFAULTS = {
-	version = 7,
+	version = 8,
 	interval = 0.6,
 	autoStart = true,
 	sound = true,
 	locked = false, -- drag the window anywhere; tick "Lock window position" in Settings to pin it
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
-	countdown = true, -- quantity is a hard total (untick to buy up to the quantity on every click)
-	resetMinutes = 5, -- count down starts over after this many minutes without buying that item
+	countdown = true, -- Focus: quantity is a hard total (untick to buy up to the quantity on every click)
+	resetMinutes = 5, -- Focus count down starts over after this many minutes without buying that item
 	reserve = 5000, -- keep 50s
 	tab = "focus",
-	mode = "all", -- "focus" = only the Focus tab's item is searched, "all" = the whole watch list
-	items = {
-		[2589] = { max = 20, qty = 100, enabled = true }, -- Linen Cloth
-		[2592] = { max = 85, qty = 60, enabled = true }, -- Wool Cloth
-		[249409] = { max = 2700, qty = 5, enabled = true }, -- Cerulean Dye
-	},
-	order = { 2589, 2592, 249409 },
+	mode = "all", -- "focus" = only the Focus tab's item is searched, "all" = the open shopping list
+	items = {}, -- the Focus item's settings
+	lists = { { name = "My list", pct = 80, track = true, items = {}, order = {}, log = {} } },
+	activeList = 1,
 	prices = {},
 	history = {},
 }
 
-local MAX_ITEMS = 8
+local MAX_ITEMS = 8 -- items per shopping list
+local MAX_LISTS = 15
+local PCT_MIN, PCT_MAX, PCT_STEP = 10, 150, 5
 local LISTING_ROWS = 6 -- cheapest listings shown on the Focus tab
 local WINDOW_SECONDS = 60
 local MAX_PER_WINDOW = 98 -- the game allows ~100 searches per minute
@@ -191,8 +191,31 @@ local function ResetIfStale(cfg)
 	end
 end
 
+-- The shopping list that's open (only that one is searched).
+local function ActiveList()
+	return db.lists and db.lists[db.activeList or 1]
+end
+
+-- An item's settings for the tab you're on: the Focus item's, or the open shopping list's.
+local function Cfg(id)
+	if not id then return nil end
+	if db.mode == "focus" then return db.items[id] end
+	local L = ActiveList()
+	return L and not L.done and L.items[id] or nil
+end
+
+-- Shopping list item with Track totals on, and all of it bought.
+local function ItemDone(L, cfg)
+	return L.track and (cfg.got or 0) >= cfg.qty
+end
+
 -- How many more of this item you still want right now.
 local function Remaining(cfg)
+	if cfg.kind == "list" then
+		local L = ActiveList()
+		if L and L.track then return math.max(0, cfg.qty - (cfg.got or 0)) end
+		return cfg.qty
+	end
 	if not db.countdown then return cfg.qty end
 	ResetIfStale(cfg)
 	return math.max(0, cfg.qty - (cfg.bought or 0))
@@ -290,19 +313,31 @@ local function Target()
 		return (r and r.avail > 0) and focusID or nil
 	end
 	if selected and results[selected] and results[selected].avail > 0 then return selected end
-	for _, id in ipairs(db.order) do
+	local L = ActiveList()
+	for _, id in ipairs(L and L.order or {}) do
 		local r = results[id]
 		if r and r.avail > 0 then return id end
 	end
 	return nil
 end
 
+-- The most you'll pay for one. Shopping list items can be a % of the normal price, which
+-- gives nil (don't buy) until the normal price is known. Otherwise it's the price you typed.
+local function MaxFor(cfg, id)
+	if cfg.kind == "list" and cfg.mode ~= "fixed" then
+		local typ = Typical(id)
+		local L = ActiveList()
+		local pct = cfg.pct or (L and L.pct) or 80
+		return typ and math.max(1, math.floor(typ * pct / 100)) or nil
+	end
+	return (cfg.max or 0) > 0 and cfg.max or nil
+end
+
 -- Typo guard: a max more than double the usual price (or, while still learning, double
 -- the cheapest listing right now) looks like a mistake, e.g. 20g instead of 20c.
 -- Nothing is bought until you click "I meant it" (which only covers that exact max).
 -- Returns the usual price when the max looks like a typo, otherwise nil.
-local function TypoRef(itemID, max, cheapestNow)
-	local cfg = db.items[itemID]
+local function TypoRef(cfg, itemID, max, cheapestNow)
 	local ref = Typical(itemID) or cheapestNow
 	if cfg and ref and (max or 0) > 2 * ref and cfg.okMax ~= max then return ref end
 	return nil
@@ -329,28 +364,29 @@ local function Fill(cfg, under, typo)
 end
 
 local function Evaluate(itemID)
-	local cfg = db.items[itemID]
+	local cfg = Cfg(itemID)
 	if not cfg then return end
-	local cheapest
 	local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID) or 0
+	local first = n > 0 and C_AuctionHouse.GetCommoditySearchResultInfo(itemID, 1)
+	local cheapest = first and first.unitPrice or nil
+	RecordPrice(itemID, cheapest) -- first, so a % of normal can use the newest price memory
+	local max = MaxFor(cfg, itemID)
 	local listings, under = {}, {}
-	local active = cfg.enabled ~= false or itemID == focusID
+	local active = (cfg.enabled ~= false or itemID == focusID) and max ~= nil
 	for i = 1, n do
 		local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
 		if not info then break end
 		local price = info.unitPrice
 		local q = (info.quantity or 0) - (info.numOwnerItems or 0) -- skip your own auctions
-		cheapest = cheapest or price
 		if i <= LISTING_ROWS then listings[#listings + 1] = { price = price, qty = q } end
-		local cheapEnough = active and (cfg.max or 0) > 0 and price <= cfg.max
+		local cheapEnough = active and price <= max
 		if cheapEnough and q > 0 then under[#under + 1] = { price = price, qty = q } end
 		if i >= LISTING_ROWS and not cheapEnough then break end
 	end
-	local typoRef = TypoRef(itemID, cfg.max, cheapest)
+	local typoRef = max and TypoRef(cfg, itemID, max, cheapest)
 	local avail, total = Fill(cfg, under, typoRef)
-	RecordPrice(itemID, cheapest)
 	local prev = results[itemID]
-	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, under = under, time = GetTime(), typo = typoRef }
+	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, under = under, time = GetTime(), typo = typoRef, max = max }
 	local relevant = db.mode ~= "focus" or itemID == focusID -- don't announce other items while on Focus
 	if avail > 0 and (not prev or prev.avail == 0) and relevant then
 		PlayAlert()
@@ -406,7 +442,11 @@ function HelpmeSniper_BuyStep()
 		return
 	end
 	local r = results[id]
-	pending = { itemID = id, qty = r.avail, expected = r.total, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now() }
+	local cfg = Cfg(id)
+	pending = {
+		itemID = id, qty = r.avail, expected = r.total, max = r.max, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now(),
+		cfg = cfg, list = (cfg and cfg.kind == "list") and ActiveList() or nil, -- where to count the purchase
+	}
 	C_AuctionHouse.StartCommoditiesPurchase(id, r.avail)
 	SetStatus(("Getting price for %d %s..."):format(r.avail, ItemName(id)), 1, 1, 0)
 	HS.Refresh()
@@ -431,19 +471,23 @@ local function NextItem()
 	if priorityID then
 		local id = priorityID
 		priorityID = nil
-		if db.items[id] then return id end
+		if Cfg(id) then return id end
 	end
 	if not scanning then return nil end
 	if db.mode == "focus" then
 		return (focusID and db.items[focusID]) and focusID or nil
 	end
-	local n = #db.order
+	-- Shopping list: ticked items take turns; finished ones (Track totals) are skipped,
+	-- so the rest get checked more often.
+	local L = ActiveList()
+	if not L or L.done then return nil end
+	local n = #L.order
 	for _ = 1, n do
 		if nextIndex > n then nextIndex = 1 end
-		local id = db.order[nextIndex]
+		local id = L.order[nextIndex]
 		nextIndex = nextIndex + 1
-		local cfg = db.items[id]
-		if cfg and cfg.enabled ~= false then return id end
+		local cfg = L.items[id]
+		if cfg and cfg.enabled ~= false and not ItemDone(L, cfg) then return id end
 	end
 	return nil
 end
@@ -491,38 +535,149 @@ local function Tick()
 end
 
 -- ============================================================================
--- Watch list changes
+-- Shopping lists
 -- ============================================================================
+
+local function NewListTable(name)
+	return { name = name, pct = 80, track = true, items = {}, order = {}, log = {} }
+end
+
+-- Opens a list: it becomes the one that's searched.
+function HS.OpenList(i)
+	if not db.lists[i] then return end
+	db.activeList = i
+	results = {}
+	selected, editID = nil, nil
+	nextIndex = 1
+	if dealMsgID then SetStatus("") end
+	HS.Refresh()
+end
+
+function HS.NewList(name)
+	if #db.lists >= MAX_LISTS then
+		Print("You have " .. MAX_LISTS .. " lists already. Delete one first.")
+		return
+	end
+	name = (name or ""):match("^%s*(.-)%s*$")
+	if name == "" then name = "List " .. (#db.lists + 1) end
+	table.insert(db.lists, NewListTable(name))
+	HS.OpenList(#db.lists)
+end
+
+function HS.RenameList(L, name)
+	name = (name or ""):match("^%s*(.-)%s*$")
+	if L and name ~= "" then L.name = name end
+	HS.Refresh()
+end
+
+-- Same items, prices and amounts, nothing bought yet.
+function HS.CopyList(i)
+	local src = db.lists[i]
+	if not src then return end
+	if #db.lists >= MAX_LISTS then
+		Print("You have " .. MAX_LISTS .. " lists already. Delete one first.")
+		return
+	end
+	local L = NewListTable(src.name .. " (copy)")
+	L.pct, L.track = src.pct, src.track
+	for _, id in ipairs(src.order) do
+		local c = DeepCopy(src.items[id])
+		c.got = 0
+		L.items[id] = c
+		L.order[#L.order + 1] = id
+	end
+	table.insert(db.lists, L)
+	HS.OpenList(#db.lists)
+end
+
+function HS.DeleteList(L)
+	local i
+	for k, v in ipairs(db.lists) do
+		if v == L then i = k end
+	end
+	if not i then return end
+	local wasOpen = i == db.activeList
+	table.remove(db.lists, i)
+	if #db.lists == 0 then db.lists[1] = NewListTable("My list") end
+	if wasOpen then
+		HS.OpenList(math.min(i, #db.lists))
+	else
+		if i < db.activeList then db.activeList = db.activeList - 1 end
+		HS.Refresh()
+	end
+end
+
+-- Finishing a list: it stops being searched and keeps a receipt of what you bought.
+function HS.MarkComplete(L)
+	L = L or ActiveList()
+	if not L or L.done then return end
+	L.done = true
+	L.doneAt = time()
+	if L == ActiveList() then
+		results = {}
+		selected, editID = nil, nil
+	end
+	SetStatus(('List "%s" complete.'):format(L.name), 0.3, 1, 0.3)
+	HS.Refresh()
+end
+
+-- Reopens a completed list with the same items, prices and amounts, and the counts at zero.
+function HS.ShopAgain()
+	local L = ActiveList()
+	if not L then return end
+	L.done, L.doneAt = nil, nil
+	L.log = {}
+	for _, cfg in pairs(L.items) do cfg.got = 0 end
+	results = {}
+	nextIndex = 1
+	SetStatus(('Shopping "%s" again.'):format(L.name), 0.8, 0.8, 0.8)
+	HS.Refresh()
+end
+
+-- True when every ticked item on a tracked list is fully bought.
+local function ListAllBought(L)
+	if not L.track or #L.order == 0 then return false end
+	for _, id in ipairs(L.order) do
+		local cfg = L.items[id]
+		if cfg and cfg.enabled ~= false and not ItemDone(L, cfg) then return false end
+	end
+	return true
+end
 
 function HS.AddItem(id)
 	if not id or not db then return end
-	local listed = false
-	for _, v in ipairs(db.order) do
-		if v == id then listed = true end
+	local L = ActiveList()
+	if not L then
+		db.lists[1] = NewListTable("My list")
+		db.activeList = 1
+		L = db.lists[1]
 	end
-	if listed then
-		Print(ItemName(id) .. " is already on your watch list.")
-	elseif #db.order >= MAX_ITEMS then
-		Print("Watch list is full (" .. MAX_ITEMS .. " items). Remove one first.")
+	if L.done then
+		Print('"' .. L.name .. '" is completed. Click Shop again first, or make a new list.')
+		return
+	end
+	if L.items[id] then
+		Print(ItemName(id) .. " is already on this list.")
+	elseif #L.order >= MAX_ITEMS then
+		Print("This list is full (" .. MAX_ITEMS .. " items). Remove one, or make a new list.")
 		return
 	else
-		db.items[id] = db.items[id] or { max = 0, qty = 20, enabled = true }
-		table.insert(db.order, id)
-		Print("Added " .. ItemName(id) .. ". Set your max price on the Watch List tab.")
+		L.items[id] = { kind = "list", mode = "pct", qty = 20, enabled = true, got = 0 }
+		table.insert(L.order, id)
+		Print(('Added %s to "%s". It counts as a deal at %d%% of its normal price or less.'):format(ItemName(id), L.name, L.pct))
 	end
 	editID = id
 	priorityID = id -- look up its price right away
 	HS.Refresh()
 end
 
-function HS.RemoveItem(id)
-	if not db.items[id] then return end
-	if id ~= db.focusItem then -- the Focus tab's item keeps its price and quantity
-		db.items[id] = nil
-		results[id] = nil
-	end
-	for i = #db.order, 1, -1 do
-		if db.order[i] == id then table.remove(db.order, i) end
+function HS.RemoveItem(id, L)
+	L = L or ActiveList()
+	if not L or not L.items[id] then return end
+	L.items[id] = nil
+	results[id] = nil
+	for i = #L.order, 1, -1 do
+		if L.order[i] == id then table.remove(L.order, i) end
 	end
 	if editID == id then editID = nil end
 	if selected == id then selected = nil end
@@ -547,33 +702,72 @@ function HS.FocusQty(delta)
 	local cfg = db.focusItem and db.items[db.focusItem]
 	if cfg then
 		cfg.qty = math.max(1, cfg.qty + delta)
+		results[db.focusItem] = nil -- the old result was worked out for the old amount
+		priorityID = db.focusItem
 		HS.Refresh()
 	end
 end
 
-function HS.MoveItem(id, delta)
-	for i, v in ipairs(db.order) do
-		if v == id then
-			local j = i + delta
-			if j >= 1 and j <= #db.order then
-				db.order[i], db.order[j] = db.order[j], db.order[i]
-			end
-			break
-		end
-	end
-	HS.Refresh()
+-- Pop-ups (the game's own dialog boxes)
+local function PopupEditBox(self)
+	return self.editBox or self.EditBox or (self.GetName and self:GetName() and _G[self:GetName() .. "EditBox"])
 end
 
-StaticPopupDialogs["HELPMESNIPER_REMOVE"] = {
-	text = "Stop watching %s?",
-	button1 = YES,
-	button2 = NO,
-	OnAccept = function(_, data) HS.RemoveItem(data) end,
-	timeout = 0,
-	whileDead = true,
-	hideOnEscape = true,
-	preferredIndex = 3,
-}
+local function PopupText(self)
+	local eb = PopupEditBox(self)
+	return eb and eb:GetText() or ""
+end
+
+local function NamePopup(text, onAccept, onShow)
+	return {
+		text = text,
+		button1 = OKAY,
+		button2 = CANCEL,
+		hasEditBox = true,
+		maxLetters = 40,
+		OnShow = function(self, data)
+			local eb = PopupEditBox(self)
+			if eb then
+				eb:SetText(onShow and onShow(data) or "")
+				eb:SetFocus()
+				eb:HighlightText()
+			end
+		end,
+		OnAccept = function(self, data) onAccept(PopupText(self), data) end,
+		EditBoxOnEnterPressed = function(self)
+			local p = self:GetParent()
+			onAccept(PopupText(p), p.data)
+			p:Hide()
+		end,
+		EditBoxOnEscapePressed = function(self) self:GetParent():Hide() end,
+		timeout = 0,
+		whileDead = true,
+		hideOnEscape = true,
+		preferredIndex = 3,
+	}
+end
+
+StaticPopupDialogs["HELPMESNIPER_NEWLIST"] = NamePopup("Name your new shopping list:", function(name) HS.NewList(name) end)
+StaticPopupDialogs["HELPMESNIPER_RENAMELIST"] = NamePopup("Rename this list:",
+	function(name, L) HS.RenameList(L, name) end,
+	function(L) return L and L.name or "" end)
+
+local function YesNo(text, onAccept)
+	return {
+		text = text,
+		button1 = YES,
+		button2 = NO,
+		OnAccept = function(_, data) onAccept(data) end,
+		timeout = 0,
+		whileDead = true,
+		hideOnEscape = true,
+		preferredIndex = 3,
+	}
+end
+
+StaticPopupDialogs["HELPMESNIPER_REMOVE"] = YesNo("Remove %s from this list?", function(d) HS.RemoveItem(d.id, d.list) end)
+StaticPopupDialogs["HELPMESNIPER_DELETELIST"] = YesNo('Delete the list "%s"? This can\'t be undone.', function(L) HS.DeleteList(L) end)
+StaticPopupDialogs["HELPMESNIPER_COMPLETE"] = YesNo('Some items aren\'t fully bought yet. Mark "%s" complete anyway?', function(L) HS.MarkComplete(L) end)
 
 -- ============================================================================
 -- UI building blocks
@@ -915,18 +1109,21 @@ end
 -- Window
 -- ============================================================================
 
-local TABS = { { key = "focus", label = "Focus" }, { key = "watch", label = "Watch List" }, { key = "settings", label = "Settings" }, { key = "history", label = "History" } }
+local TABS = { { key = "focus", label = "Focus" }, { key = "shop", label = "Shopping List" }, { key = "settings", label = "Settings" }, { key = "history", label = "History" } }
 
 function HS.ShowTab(key)
 	if not ui.panels[key] then key = "focus" end
 	db.tab = key
+	local oldMode = db.mode
 	if key == "focus" then
 		db.mode = "focus"
-	elseif key == "watch" then
+	elseif key == "shop" then
 		db.mode = "all"
 	end
+	if db.mode ~= oldMode then results = {} end -- Focus and the shopping list have their own settings
 	HS.UpdateMode()
 	HS.ClosePicker() -- the search list belongs to the tab you were on
+	if ui.listMenu then ui.listMenu:Hide() end
 	if dealMsgID and Target() ~= dealMsgID then SetStatus("") end -- switching tabs: drop a deal message that no longer applies
 	for _, t in ipairs(TABS) do
 		ui.panels[t.key]:SetShown(t.key == key)
@@ -935,8 +1132,124 @@ function HS.ShowTab(key)
 	HS.Refresh()
 end
 
-local function BuildWatchPanel(p)
-	Text(p, "GameFontNormalSmall", 2, -7):SetText("Add item:")
+-- The menu that drops down from the list name: switch lists, completed lists, rename/copy/delete.
+local MENU_ROWS = MAX_LISTS + 4
+
+local function ListMenu()
+	if ui.listMenu then return ui.listMenu end
+	local m = CreateFrame("Frame", nil, ui.frame, "BackdropTemplate")
+	m:SetFrameStrata("DIALOG")
+	m:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
+	m:SetBackdropColor(0.08, 0.09, 0.1, 0.98)
+	m:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	m:SetWidth(220)
+	m.rows = {}
+	for i = 1, MENU_ROWS do
+		local b = CreateFrame("Button", nil, m)
+		b:SetSize(212, 16)
+		b:SetPoint("TOPLEFT", 4, -4 - (i - 1) * 16)
+		local hl = b:CreateTexture(nil, "HIGHLIGHT")
+		hl:SetAllPoints()
+		hl:SetColorTexture(0.3, 0.5, 0.8, 0.35)
+		b.text = Text(b, "GameFontHighlightSmall", 4, -2, 204)
+		b:SetScript("OnClick", function(self)
+			m:Hide()
+			if self.action then self.action() end
+		end)
+		m.rows[i] = b
+	end
+	m:Hide()
+	ui.listMenu = m
+	return m
+end
+
+function HS.ToggleListMenu()
+	local m = ListMenu()
+	if m:IsShown() then
+		m:Hide()
+		return
+	end
+	local entries = {}
+	local function add(text, action) entries[#entries + 1] = { text = text, action = action } end
+	local function mark(i) return i == db.activeList and "|cff33ff33> |r" or "   " end
+	for i, L in ipairs(db.lists) do
+		if not L.done then add(mark(i) .. L.name, function() HS.OpenList(i) end) end
+	end
+	local anyDone = false
+	for _, L in ipairs(db.lists) do
+		if L.done then anyDone = true end
+	end
+	if anyDone then
+		add("|cff888888Completed:|r", nil)
+		for i, L in ipairs(db.lists) do
+			if L.done then add(mark(i) .. "|cffaaaaaa" .. L.name .. "|r", function() HS.OpenList(i) end) end
+		end
+	end
+	local cur = db.activeList
+	local curList = db.lists[cur]
+	add("|cffffd100Rename this list|r", function() StaticPopup_Show("HELPMESNIPER_RENAMELIST", nil, nil, curList) end)
+	add("|cffffd100Copy this list|r", function() HS.CopyList(cur) end)
+	add("|cffffd100Delete this list|r", function()
+		if curList then StaticPopup_Show("HELPMESNIPER_DELETELIST", curList.name, nil, curList) end
+	end)
+	for i, b in ipairs(m.rows) do
+		local e = entries[i]
+		b:SetShown(e ~= nil)
+		if e then
+			b.text:SetText(e.text)
+			b.action = e.action
+			b:EnableMouse(e.action ~= nil)
+		end
+	end
+	m:SetHeight(8 + #entries * 16)
+	m:ClearAllPoints()
+	m:SetPoint("TOPLEFT", ui.listBtn, "BOTTOMLEFT", 0, -2)
+	m:Show()
+end
+
+local function BuildShopPanel(p)
+	-- Row 1: which list, new list, Track totals, Live marker
+	ui.listBtn = Button(p, "My list", 0, -2, 150, 22, function() HS.ToggleListMenu() end)
+	local arrow = ui.listBtn:CreateTexture(nil, "OVERLAY")
+	arrow:SetSize(14, 14)
+	arrow:SetPoint("RIGHT", -6, 0)
+	arrow:SetTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Up")
+	Tip(ui.listBtn, "Switch lists, see completed lists,\nor rename, copy or delete this list")
+	Tip(Button(p, "New list", 154, -2, 66, 22, function() StaticPopup_Show("HELPMESNIPER_NEWLIST") end), "Start a new shopping list")
+	ui.trackCheck = Check(p, "Track totals", 226, 0, function(self)
+		local L = ActiveList()
+		if L then
+			L.track = self:GetChecked() and true or false
+			results = {}
+			HS.Refresh()
+		end
+	end)
+	Tip(ui.trackCheck, "On: counts what you buy and never buys past each amount.\nIt remembers until you mark the list complete.\nOff: every click buys up to the amount.")
+	ui.shopLive = Text(p, "GameFontHighlightSmall", 350, -8, 104, "RIGHT")
+
+	-- A completed list shows its receipt
+	local d = CreateFrame("Frame", nil, p)
+	d:SetAllPoints()
+	ui.doneView = d
+	ui.doneTitle = Text(d, "GameFontNormal", 2, -34, 450)
+	ui.doneTotal = Text(d, "GameFontHighlightSmall", 2, -54, 450)
+	ui.doneLines = {}
+	for i = 1, 9 do
+		ui.doneLines[i] = Text(d, "GameFontHighlightSmall", 2, -76 - (i - 1) * 17, 450)
+	end
+	Tip(Button(d, "Shop again", 0, -240, 110, 22, function() HS.ShopAgain() end), "Open this list again with the same items, prices\nand amounts, and the counts back at zero")
+	Button(d, "Delete list", 116, -240, 90, 22, function()
+		local L = ActiveList()
+		if L then StaticPopup_Show("HELPMESNIPER_DELETELIST", L.name, nil, L) end
+	end)
+
+	-- An open list
+	local b = CreateFrame("Frame", nil, p)
+	b:SetAllPoints()
+	ui.shopBody = b
+
+	-- Row 2: add items, and roughly what the rest of the list costs
+	Text(b, "GameFontNormalSmall", 2, -33, 30):SetText("Add:")
 	local function AddFromCursor()
 		local kind, id, link = GetCursorInfo()
 		if kind == "item" then
@@ -945,37 +1258,63 @@ local function BuildWatchPanel(p)
 			return true
 		end
 	end
-	ui.dropBtn = Button(p, "Drop item here", 60, -2, 120, 22, function()
+	ui.dropBtn = Button(b, "Drop item here", 32, -28, 104, 22, function()
 		if not AddFromCursor() then Print("Pick up an item from your bags, then click or drop it on this button.") end
 	end)
 	ui.dropBtn:SetScript("OnReceiveDrag", AddFromCursor)
-
-	ui.addBox = CreateFrame("EditBox", nil, p, "InputBoxTemplate")
+	ui.addBox = CreateFrame("EditBox", nil, b, "InputBoxTemplate")
 	ui.addBox:SetSize(150, 20)
-	ui.addBox:SetPoint("TOPLEFT", 192, -3)
+	ui.addBox:SetPoint("TOPLEFT", 146, -29)
 	ui.addBox:SetAutoFocus(false)
 	ui.addBox:SetFontObject("GameFontHighlightSmall")
 	ui.addHint = ui.addBox:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	ui.addHint:SetPoint("LEFT", 2, 0)
-	ui.addHint:SetText("or shift-click / name / ID")
+	ui.addHint:SetText("type a name / shift-click")
 	ui.addBox:SetScript("OnEditFocusGained", function() ui.addHint:Hide() end)
 	ui.addBox:SetScript("OnEditFocusLost", function(self) ui.addHint:SetShown(self:GetText() == "") end)
 	MakeSearchBox(ui.addBox, HS.AddItem)
 	ui.addBox:SetScript("OnReceiveDrag", AddFromCursor)
-	ui.watchLive = Text(p, "GameFontHighlightSmall", 350, -8, 104, "RIGHT")
+	ui.costText = Text(b, "GameFontHighlightSmall", 300, -33, 156, "RIGHT")
 
-	Text(p, "GameFontNormalSmall", 0, -30, 24):SetText("On")
-	Text(p, "GameFontNormalSmall", 26, -30, 98):SetText("Item")
-	Text(p, "GameFontNormalSmall", 132, -30, 120):SetText("Max price each")
-	Text(p, "GameFontNormalSmall", 266, -30, 76, "CENTER"):SetText("Amount")
-	Text(p, "GameFontNormalSmall", 346, -30, 84, "RIGHT"):SetText("Now")
+	-- Row 3: the list's deal %, and Mark complete
+	Text(b, "GameFontNormalSmall", 2, -58, 52):SetText("Deals at")
+	local function ListPct(delta)
+		local L = ActiveList()
+		if L then
+			L.pct = math.min(PCT_MAX, math.max(PCT_MIN, (L.pct or 80) + delta))
+			results = {}
+			HS.Refresh()
+		end
+	end
+	Button(b, "-", 54, -54, 20, 20, function() ListPct(-PCT_STEP) end)
+	ui.pctText = Text(b, "GameFontHighlight", 76, -57, 36, "CENTER")
+	Button(b, "+", 114, -54, 20, 20, function() ListPct(PCT_STEP) end)
+	Text(b, "GameFontNormalSmall", 140, -58, 200):SetText("of normal price or less")
+	ui.markBtn = Button(b, "Mark complete", 356, -54, 100, 20, function()
+		local L = ActiveList()
+		if not L then return end
+		if ListAllBought(L) then
+			HS.MarkComplete()
+		else
+			StaticPopup_Show("HELPMESNIPER_COMPLETE", L.name, nil, L)
+		end
+	end)
+	Tip(ui.markBtn, "Finish this list: it stops searching and keeps a receipt.\nLater, pick it from the list menu and click Shop again to reuse it.")
 
-	ui.watchRows = {}
+	-- Column headings
+	Text(b, "GameFontNormalSmall", 0, -78, 24):SetText("On")
+	Text(b, "GameFontNormalSmall", 24, -78, 118):SetText("Item")
+	Text(b, "GameFontNormalSmall", 146, -78, 72):SetText("Deal at")
+	Text(b, "GameFontNormalSmall", 222, -78, 70, "RIGHT"):SetText("Normal")
+	Text(b, "GameFontNormalSmall", 296, -78, 100, "RIGHT"):SetText("Now")
+	ui.gotHeader = Text(b, "GameFontNormalSmall", 400, -78, 54, "RIGHT")
+
+	ui.shopRows = {}
 	for i = 1, MAX_ITEMS do
-		local row = CreateFrame("Frame", nil, p)
-		row:SetSize(456, 20)
-		row:SetPoint("TOPLEFT", 0, -46 - (i - 1) * 21)
-		row.sel = row:CreateTexture(nil, "BACKGROUND") -- the item you clicked
+		local row = CreateFrame("Button", nil, b)
+		row:SetSize(456, 18)
+		row:SetPoint("TOPLEFT", 0, -92 - (i - 1) * 18)
+		row.sel = row:CreateTexture(nil, "BACKGROUND") -- the item you clicked (edit strip)
 		row.sel:SetAllPoints()
 		row.sel:SetColorTexture(0.25, 0.4, 0.7, 0.3)
 		row.sel:Hide()
@@ -983,87 +1322,125 @@ local function BuildWatchPanel(p)
 		row.hl:SetAllPoints()
 		row.hl:SetColorTexture(0.2, 0.55, 0.2, 0.35)
 		row.hl:Hide()
-
-		row.on = Check(row, nil, 0, 0, function(self)
-			local cfg = row.itemID and db.items[row.itemID]
+		local hover = row:CreateTexture(nil, "HIGHLIGHT")
+		hover:SetAllPoints()
+		hover:SetColorTexture(1, 1, 1, 0.06)
+		row.on = Check(row, nil, 0, 2, function(self)
+			local L = ActiveList()
+			local cfg = L and row.itemID and L.items[row.itemID]
 			if cfg then
 				cfg.enabled = self:GetChecked() and true or false
-				if not cfg.enabled then results[row.itemID] = nil end
-				HS.Refresh()
-			end
-		end)
-
-		row.nameBtn = CreateFrame("Button", nil, row)
-		row.nameBtn:SetSize(100, 20)
-		row.nameBtn:SetPoint("TOPLEFT", 24, 0)
-		row.name = Text(row.nameBtn, nil, 0, -4, 100)
-		row.nameBtn:SetScript("OnClick", function()
-			editID = row.itemID -- show its prices below
-			selected = row.itemID -- and make it the one BUY buys when it has a deal
-			HS.Refresh()
-		end)
-
-		row.money = MoneyBoxes(row, 126, -1, function(copper)
-			local cfg = row.itemID and db.items[row.itemID]
-			if cfg then
-				cfg.max = copper
 				results[row.itemID] = nil
-				priorityID = row.itemID
-			end
-			HS.Refresh()
-		end)
-
-		row.minus = Button(row, "-", 266, 0, 20, 20, function()
-			local cfg = row.itemID and db.items[row.itemID]
-			if cfg then
-				cfg.qty = math.max(1, cfg.qty - (IsShiftKeyDown() and 10 or 1))
+				if cfg.enabled then priorityID = row.itemID end
 				HS.Refresh()
 			end
 		end)
-		Tip(row.minus, "Shift-click: 10 at a time")
-		row.qty = NumberBox(row, 284, -1, 30, 4)
-		row.qty:SetJustifyH("CENTER")
-		row.qty:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
-		row.qty:SetScript("OnEditFocusLost", function(self)
-			local cfg = row.itemID and db.items[row.itemID]
-			local v = tonumber(self:GetText())
-			if cfg and v and v >= 1 then cfg.qty = math.floor(v) end
-			HS.Refresh()
-		end)
-		row.plus = Button(row, "+", 322, 0, 20, 20, function()
-			local cfg = row.itemID and db.items[row.itemID]
-			if cfg then
-				cfg.qty = cfg.qty + (IsShiftKeyDown() and 10 or 1)
+		row.name = Text(row, nil, 24, -3, 118)
+		row.deal = Text(row, nil, 146, -3, 72)
+		row.normal = Text(row, nil, 222, -3, 70, "RIGHT")
+		row.now = Text(row, nil, 296, -3, 100, "RIGHT")
+		row.got = Text(row, nil, 400, -3, 54, "RIGHT")
+		row:SetScript("OnClick", function(self)
+			if self.itemID then
+				-- Finish any half-typed price or amount for the item that's open now, first.
+				for j = 1, 3 do ui.fixMoney[j]:ClearFocus() end
+				ui.itemQty:ClearFocus()
+				editID = self.itemID -- open it in the edit strip
+				selected = self.itemID -- and buy it first when it's a deal
 				HS.Refresh()
 			end
 		end)
-		Tip(row.plus, "Shift-click: 10 at a time")
-
-		row.now = Text(row, nil, 346, -4, 84, "RIGHT")
-
-		row.del = Button(row, "X", 434, 0, 22, 20, function()
-			if row.itemID then StaticPopup_Show("HELPMESNIPER_REMOVE", ItemName(row.itemID), nil, row.itemID) end
-		end)
-		Tip(row.del, "Stop watching this item")
-		ui.watchRows[i] = row
+		ui.shopRows[i] = row
 	end
+	ui.emptyHint = Text(b, "GameFontDisableSmall", 4, -100, 448)
+	ui.emptyHint:SetText("Empty list. Add items above: type a name, drop an item, or shift-click it.")
 
-	ui.editInfo = Text(p, "GameFontHighlightSmall", 2, -220, 450)
-	ui.pctLabel = Text(p, "GameFontNormalSmall", 2, -246, 120)
-	ui.pctLabel:SetText("Max = % of typical:")
-	ui.pctBtns = {}
-	for i, pct in ipairs({ 70, 80, 90, 100 }) do
-		ui.pctBtns[i] = Button(p, pct .. "%", 124 + (i - 1) * 54, -242, 50, 20, function()
-			local cfg = editID and db.items[editID]
-			local typ = editID and Typical(editID)
-			if cfg and typ then
-				cfg.max = math.max(1, math.floor(typ * pct / 100))
-				results[editID] = nil
-				priorityID = editID
-				HS.Refresh()
-			end
-		end)
+	-- Edit strip: change the clicked item
+	local s = CreateFrame("Frame", nil, b)
+	s:SetSize(456, 22)
+	s:SetPoint("TOPLEFT", 0, -240)
+	ui.stripHint = Text(s, "GameFontDisableSmall", 2, -6, 450)
+	ui.stripHint:SetText("Click an item to change its deal price or amount, or to remove it.")
+	local c = CreateFrame("Frame", nil, s)
+	c:SetAllPoints()
+	ui.stripCtl = c
+	local function EditCfg()
+		local L = ActiveList()
+		return L, L and editID and L.items[editID]
 	end
+	local function Changed()
+		if editID then
+			results[editID] = nil
+			priorityID = editID
+		end
+		HS.Refresh()
+	end
+	ui.modeBtn = Button(c, "% of normal", 0, 0, 76, 20, function()
+		local _, cfg = EditCfg()
+		if not cfg then return end
+		if cfg.mode == "fixed" then
+			cfg.mode = "pct"
+		else
+			if (cfg.max or 0) <= 0 then cfg.max = MaxFor(cfg, editID) or 0 end -- start from today's % price
+			cfg.mode = "fixed"
+		end
+		Changed()
+	end)
+	Tip(ui.modeBtn, "Click to switch between a % of the\nnormal price and a fixed price")
+	local pf = CreateFrame("Frame", nil, c)
+	pf:SetAllPoints()
+	ui.pctFrame = pf
+	local function ItemPct(delta)
+		local L, cfg = EditCfg()
+		if cfg then
+			cfg.pct = math.min(PCT_MAX, math.max(PCT_MIN, (cfg.pct or L.pct or 80) + delta))
+			Changed()
+		end
+	end
+	Button(pf, "-", 80, 0, 20, 20, function() ItemPct(-PCT_STEP) end)
+	ui.itemPctText = Text(pf, "GameFontHighlight", 102, -3, 36, "CENTER")
+	Button(pf, "+", 140, 0, 20, 20, function() ItemPct(PCT_STEP) end)
+	ui.itemMaxText = Text(pf, "GameFontHighlightSmall", 164, -4, 52)
+	local ff = CreateFrame("Frame", nil, c)
+	ff:SetAllPoints()
+	ui.fixFrame = ff
+	ui.fixMoney = MoneyBoxes(ff, 78, -1, function(copper)
+		local _, cfg = EditCfg()
+		if cfg then cfg.max = copper end
+		Changed()
+	end)
+	Text(c, "GameFontNormalSmall", 218, -4, 44):SetText("Amount")
+	local function ItemQty(delta)
+		local _, cfg = EditCfg()
+		if cfg then
+			cfg.qty = math.max(1, cfg.qty + delta)
+			Changed()
+		end
+	end
+	Tip(Button(c, "-", 262, 0, 20, 20, function() ItemQty(IsShiftKeyDown() and -10 or -1) end), "Shift-click: 10 at a time")
+	ui.itemQty = NumberBox(c, 280, -1, 32, 4)
+	ui.itemQty:SetJustifyH("CENTER")
+	ui.itemQty:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+	ui.itemQty:SetScript("OnEditFocusLost", function(self)
+		local _, cfg = EditCfg()
+		local v = tonumber(self:GetText())
+		if cfg and v and v >= 1 and math.floor(v) ~= cfg.qty then
+			cfg.qty = math.floor(v)
+			Changed()
+		else
+			HS.Refresh()
+		end
+	end)
+	Tip(Button(c, "+", 320, 0, 20, 20, function() ItemQty(IsShiftKeyDown() and 10 or 1) end), "Shift-click: 10 at a time")
+	ui.itemOk = Button(c, "I meant it", 344, 0, 62, 20, function()
+		local _, cfg = EditCfg()
+		if cfg then cfg.okMax = cfg.max end
+		Changed()
+	end)
+	Tip(ui.itemOk, "This fixed price is over double the usual price.\nClick if that's really what you want to pay.")
+	ui.itemRemove = Button(c, "Remove", 410, 0, 46, 20, function()
+		if editID then StaticPopup_Show("HELPMESNIPER_REMOVE", ItemName(editID), nil, { id = editID, list = ActiveList() }) end
+	end)
 end
 
 local function BuildSettingsPanel(p)
@@ -1094,6 +1471,7 @@ local function BuildSettingsPanel(p)
 
 	-- Other
 	Text(p, "GameFontNormal", 2, -94, 200):SetText("Other")
+	Button(p, "How it works (full guide)", 290, -92, 166, 20, function() HS.ShowGuide() end)
 	Text(p, "GameFontNormalSmall", 2, -116, 220):SetText("Search every (seconds):")
 	Button(p, "-", 236, -112, 22, 20, function()
 		db.interval = math.max(MIN_INTERVAL, math.floor((db.interval - 0.1) * 10 + 0.5) / 10)
@@ -1192,7 +1570,11 @@ local function BuildFocusPanel(p)
 	ui.fQty:SetScript("OnEditFocusLost", function(self)
 		local cfg = db.focusItem and db.items[db.focusItem]
 		local v = tonumber(self:GetText())
-		if cfg and v and v >= 1 then cfg.qty = math.floor(v) end
+		if cfg and v and v >= 1 and math.floor(v) ~= cfg.qty then
+			cfg.qty = math.floor(v)
+			results[db.focusItem] = nil
+			priorityID = db.focusItem
+		end
 		HS.Refresh()
 	end)
 	Tip(Button(b, "+", 372, -74, 20, 20, function() HS.FocusQty(IsShiftKeyDown() and 10 or 1) end), "Shift-click: 10 at a time")
@@ -1317,6 +1699,7 @@ local function BuildFrame()
 	local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
 	close:SetPoint("TOPRIGHT", 0, 0)
 
+	Tip(Button(f, "?", 330, -7, 22, 20, function() HS.ShowGuide() end), "How it works (full guide)")
 	ui.startBtn = Button(f, "Start", 356, -7, 80, 20, function()
 		scanning = not scanning
 		SetStatus(scanning and "Scanning..." or "Paused.", 0.8, 0.8, 0.8)
@@ -1333,7 +1716,7 @@ local function BuildFrame()
 		ui.panels[t.key] = p
 	end
 	BuildFocusPanel(ui.panels.focus)
-	BuildWatchPanel(ui.panels.watch)
+	BuildShopPanel(ui.panels.shop)
 	BuildSettingsPanel(ui.panels.settings)
 	BuildHistoryPanel(ui.panels.history)
 
@@ -1351,6 +1734,214 @@ local function BuildFrame()
 	ui.buyTint = ui.buyBtn:CreateTexture(nil, "ARTWORK")
 	ui.buyTint:SetPoint("TOPLEFT", 3, -3)
 	ui.buyTint:SetPoint("BOTTOMRIGHT", -3, 3)
+end
+
+-- ============================================================================
+-- Welcome page (shown once) and the full guide
+-- ============================================================================
+
+local H = "|cffffd100" -- heading color
+local WELCOME_TEXT = [[Buy auction house materials fast, without overpaying.
+
+]] .. H .. [[1. Focus:|r one item, searched as fast as the game allows. Use this to race for deals.
+
+]] .. H .. [[2. Shopping Lists:|r make lists of what you need. It tells you when each item hits a good price, tracks what you've bought, and you mark the list complete when you're done.
+
+]] .. H .. [[3. Buy:|r when the big button turns |cff33ff33green|r, click it. Keep clicking to keep buying.
+
+]] .. H .. [[4. Safe:|r never over your max price, never below your gold floor, never more than your total.
+
+|cffaaaaaaHover over buttons for tips. Click ? at the top any time for the full guide.|r]]
+
+local GUIDE = {
+	{ title = "Getting started", text = H .. [[Getting started|r
+
+Helpme Sniper opens by itself when you open the auction house, just right of the auction house window. Drag it anywhere and it remembers the spot.
+
+]] .. H .. [[Start / Stop|r (top right) turns searching on and off. It starts by itself when the auction house opens, unless you turn that off in Settings.
+
+The small |cff33ff33Live|r marker means it's searching. |cffff8833Paused|r means it isn't.
+
+There are four tabs:
+- ]] .. H .. [[Focus:|r one item, searched as fast as the game allows.
+- ]] .. H .. [[Shopping List:|r your lists of things to buy at good prices.
+- ]] .. H .. [[Settings:|r safety and other options.
+- ]] .. H .. [[History:|r what you bought and spent today.
+
+The status line and the big BUY button at the bottom are the same on every tab.]] },
+
+	{ title = "Adding items", text = H .. [[Adding items|r
+
+The Focus tab and the Shopping List both have a box for adding items. You can:
+
+- ]] .. H .. [[Type the name.|r After 3 letters, matching items for sale drop down, with how many are listed and the cheapest price. Click one, or use the Up/Down keys and Enter. Escape closes the list.
+- ]] .. H .. [[Drop it|r from your bags on the "Drop item here" button.
+- ]] .. H .. [[Shift-click it|r (in your bags or a chat link) while the box is selected.
+- ]] .. H .. [[Type its ID number|r and press Enter.
+
+Only items sold by quantity work: cloth, herbs, ore, dye and so on. Gear and bags can't be bought this way, so the search leaves them out.]] },
+
+	{ title = "Focus", text = H .. [[Focus|r
+
+Focus is for racing: pick one item, and only that item is searched, as fast as the game allows (about every 0.6 seconds).
+
+- ]] .. H .. [[Max price each:|r the most you'll pay for one, in gold, silver and copper.
+- ]] .. H .. [[70% to 100% buttons:|r set your max to that share of the item's normal price.
+- ]] .. H .. [[Total / Per buy:|r how many you want. With Count down ticked it's a total. Unticked, every click can buy up to that many.
+- ]] .. H .. [[Count down:|r counts what you've bought and stops at your total. It starts over after 5 minutes without buying that item (change that in Settings), or when you click Reset.
+- ]] .. H .. [[The big line:|r YES means you can buy now, with how many, the price and your max. NO shows the cheapest price against your max. TYPO? means your max looks like a mistake (see Safety).
+- ]] .. H .. [[Listings:|r the 6 cheapest listings with a running total. Ones at or under your max are marked green.]] },
+
+	{ title = "Shopping Lists", text = H .. [[Shopping Lists|r
+
+Shopping lists are for filling a list of materials at good prices, without racing.
+
+- ]] .. H .. [[Lists:|r click the list name at the top to switch lists, see completed lists, or rename, copy or delete the open list. "New list" starts another. Only the open list is searched, which keeps it fast.
+- ]] .. H .. [[Deals at X% of normal:|r an item counts as a deal when it's at or under that share of its normal price. Click an item to give it its own % or a fixed price instead.
+- ]] .. H .. [[Columns:|r On (tick to search it), Deal at, Normal (its usual price), Now (the cheapest price and how far it is from normal, or YES when it's a deal), and Got.
+- ]] .. H .. [[Track totals:|r when on, it counts what you buy (like "40/180") and never buys past each amount. It remembers until you mark the list complete, even after logging off. When off, every click buys up to the amount.
+- ]] .. H .. [[Mark complete:|r finishes the list. It stops searching and keeps a receipt of what you bought, what you paid, and how that compares with normal.
+- ]] .. H .. [[Shop again:|r open a completed list from the list menu and click Shop again. Same items, prices and amounts, with the counts back at zero.
+- ]] .. H .. [[Edit strip:|r click an item to switch between % of normal and a fixed price, change its amount, or remove it.
+- ]] .. H .. [[Rest of list:|r roughly what the rest of the list would cost at today's prices. It turns red when that's more than you can spend.
+
+Normal prices take about 10 minutes of watching to learn. Until then, a % item shows "learning" and won't buy. Fixed-price items work straight away.]] },
+
+	{ title = "Buying", text = H .. [[Buying|r
+
+Click the big button, or set a key: Esc > Options > Keybindings > AddOns > Helpme Sniper. A macro works too: /click HelpmeSniperBuyButton
+
+The button shows what a click will do:
+- |cff33ff33Green:|r clicking buys, for example "BUY 7 Wool Cloth · 9s each (max 10s)".
+- |cffffd100Yellow:|r busy getting the price or buying. Keep clicking.
+- Grey: nothing at your price right now.
+- |cffff5555Red:|r your max looks like a typo.
+
+- ]] .. H .. [[One click:|r the click asks the auction house for the exact price, and the addon buys straight away if it's still at or under your max. If the game ever refuses that, the addon switches to "click again to buy" by itself.
+- ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
+- ]] .. H .. [[Someone beat you?|r If the price comes back over your max, it cancels and nothing is bought.]] },
+
+	{ title = "Safety", text = H .. [[Safety|r
+
+There are no pop-ups to click through. These rules protect you instead:
+
+- ]] .. H .. [[Max price:|r every buy costs no more than the price it showed you, which is at or under your max.
+- ]] .. H .. [[Never spend below:|r your gold never drops under this amount (set it in Settings).
+- ]] .. H .. [[Totals:|r Count down (Focus) and Track totals (Shopping List) never buy more than your amount.
+- ]] .. H .. [[Typo guard:|r if a price you typed is more than double the usual price (say 20g instead of 20c), it warns you and won't buy until you click "I meant it". That only covers that exact price.
+- ]] .. H .. [[Price check:|r every buy gets the exact price first. If it's higher than what it showed you (say someone bought the cheap ones first), or more than you can spend, it cancels and searches again right away.]] },
+
+	{ title = "Settings", text = H .. [[Settings|r
+
+]] .. H .. [[Safety|r
+- Never spend below: the gold the addon always leaves you.
+- Buy in one click: gets the price and buys with one click. Untick it to always click twice.
+- Count down resets after: how long the Focus count down waits before starting over.
+
+]] .. H .. [[Other|r
+- Search every: how often it searches. 0.6 seconds is the fastest the game allows.
+- Play a sound when a deal appears.
+- Start searching when the auction house opens.
+- Lock window position: stops the window from being dragged.]] },
+
+	{ title = "Tips and limits", text = H .. [[Tips and limits|r
+
+- The game allows about 100 auction searches a minute across all addons. Running TSM's Sniper at the same time slows both down.
+- The auction house handles one purchase at a time, so items are bought one after another, not all at once.
+- On a shopping list, ticked items take turns. With 4 items, each is checked about every 2.4 seconds. Finished items are skipped, so the rest speed up.
+- Normal prices come from what the addon has seen over the last 3 days.
+- Typing a name searches the auction house, so the auction house window shows those results too. That's harmless.
+- Type /hsnipe in chat for a few text commands.]] },
+}
+
+function HS.ShowWelcome()
+	if not ui.welcome then
+		local w = CreateFrame("Frame", nil, ui.frame, "BackdropTemplate")
+		w:SetFrameStrata("DIALOG")
+		w:SetPoint("TOPLEFT", 8, -30)
+		w:SetPoint("BOTTOMRIGHT", -8, 8)
+		w:EnableMouse(true) -- nothing underneath can be clicked by accident
+		w:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
+		w:SetBackdropColor(0.06, 0.07, 0.08, 1)
+		w:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+		local title = w:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+		title:SetPoint("TOP", 0, -14)
+		title:SetText("Welcome to Helpme Sniper")
+		local fs = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		fs:SetPoint("TOPLEFT", 18, -44)
+		fs:SetWidth(420)
+		fs:SetJustifyH("LEFT")
+		fs:SetJustifyV("TOP")
+		fs:SetSpacing(3)
+		fs:SetText(WELCOME_TEXT)
+		Button(w, "Full guide", 106, -322, 116, 26, function()
+			db.seenWelcome = true
+			w:Hide()
+			HS.ShowGuide()
+		end)
+		Button(w, "Got it", 234, -322, 116, 26, function()
+			db.seenWelcome = true
+			w:Hide()
+		end)
+		ui.welcome = w
+	end
+	ui.welcome:Show()
+end
+
+function HS.GuideTopic(i)
+	local g = ui.guide
+	if not g or not GUIDE[i] then return end
+	g.topic = i
+	g.text:SetText(GUIDE[i].text)
+	g.content:SetHeight(g.text:GetStringHeight() + 16)
+	g.scroll:SetVerticalScroll(0)
+	for j, b in ipairs(g.tabs) do
+		if j == i then b:LockHighlight() else b:UnlockHighlight() end
+	end
+end
+
+function HS.ShowGuide()
+	if not ui.guide then
+		local g = CreateFrame("Frame", "HelpmeSniperGuide", UIParent, "BackdropTemplate")
+		g:SetSize(620, 440)
+		g:SetPoint("CENTER")
+		g:SetFrameStrata("DIALOG")
+		g:SetClampedToScreen(true)
+		g:SetMovable(true)
+		g:EnableMouse(true)
+		g:RegisterForDrag("LeftButton")
+		g:SetScript("OnDragStart", g.StartMoving)
+		g:SetScript("OnDragStop", g.StopMovingOrSizing)
+		g:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
+		g:SetBackdropColor(0.05, 0.06, 0.07, 0.98)
+		g:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+		local title = g:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+		title:SetPoint("TOPLEFT", 12, -10)
+		title:SetText("Helpme Sniper: how it works")
+		local close = CreateFrame("Button", nil, g, "UIPanelCloseButton")
+		close:SetPoint("TOPRIGHT", 0, 0)
+		g.tabs = {}
+		for i, topic in ipairs(GUIDE) do
+			g.tabs[i] = Button(g, topic.title, 10, -40 - (i - 1) * 28, 150, 24, function() HS.GuideTopic(i) end)
+		end
+		local sf = CreateFrame("ScrollFrame", "HelpmeSniperGuideScroll", g, "UIPanelScrollFrameTemplate")
+		sf:SetPoint("TOPLEFT", 172, -40)
+		sf:SetPoint("BOTTOMRIGHT", -32, 14)
+		local content = CreateFrame("Frame", nil, sf)
+		content:SetSize(410, 10)
+		sf:SetScrollChild(content)
+		local fs = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		fs:SetPoint("TOPLEFT", 4, -4)
+		fs:SetWidth(400)
+		fs:SetJustifyH("LEFT")
+		fs:SetJustifyV("TOP")
+		fs:SetSpacing(3)
+		g.scroll, g.content, g.text = sf, content, fs
+		table.insert(UISpecialFrames, "HelpmeSniperGuide") -- Escape closes it
+		ui.guide = g
+	end
+	ui.guide:Show()
+	HS.GuideTopic(ui.guide.topic or 1)
 end
 
 -- ============================================================================
@@ -1373,8 +1964,8 @@ local function RefreshBuy()
 	elseif pending then
 		SetBuy(("Getting price for %d %s..."):format(pending.qty, ItemName(pending.itemID)), 1, 0.82, 0)
 	elseif target then
-		local r, cfg = results[target], db.items[target]
-		SetBuy(("BUY %d %s · %s each (max %s)"):format(r.avail, ItemName(target), MoneyPlain(r.total / r.avail), MoneyPlain(cfg.max)), 0.3, 1, 0.3)
+		local r = results[target]
+		SetBuy(("BUY %d %s · %s each (max %s)"):format(r.avail, ItemName(target), MoneyPlain(r.total / r.avail), MoneyPlain(r.max or 0)), 0.3, 1, 0.3)
 	else
 		-- Nothing to buy: on the Focus tab, say why if it's something you can fix.
 		local id = db.mode == "focus" and db.focusItem
@@ -1390,70 +1981,156 @@ local function RefreshBuy()
 	end
 end
 
-local function RefreshWatch()
-	ui.watchLive:SetText(LiveText())
+-- "82c -4%": a price and how far it is from normal (green when cheaper).
+local function NowText(price, typ)
+	if not price then return "" end
+	local s = Money(price)
+	if typ and typ > 0 then
+		local d = math.floor((price / typ - 1) * 100 + 0.5)
+		if d < 0 then
+			s = s .. (" |cff33ff33%d%%|r"):format(d)
+		elseif d > 0 then
+			s = s .. (" |cffaaaaaa+%d%%|r"):format(d)
+		end
+	end
+	return s
+end
+
+-- A completed list: its receipt.
+local function RefreshDone(L)
+	ui.doneTitle:SetText(('"%s" completed %s'):format(L.name, L.doneAt and date("%d %b %H:%M", L.doneAt) or ""))
+	local lines, spent, seen = {}, 0, {}
+	local function line(id)
+		local e = L.log and L.log[id]
+		if not e or seen[id] or (e.qty or 0) <= 0 then return end
+		seen[id] = true
+		spent = spent + e.spent
+		local s = ("%d %s for %s (avg %s"):format(e.qty, ItemName(id), Money(e.spent), Money(e.spent / e.qty))
+		if (e.normal or 0) > 0 then
+			local d = math.floor((1 - e.spentN / e.normal) * 100 + 0.5)
+			if d >= 0 then
+				s = s .. (", |cff33ff33%d%% under normal|r"):format(d)
+			else
+				s = s .. (", %d%% over normal"):format(-d)
+			end
+		end
+		lines[#lines + 1] = s .. ")"
+	end
+	for _, id in ipairs(L.order) do line(id) end
+	for id in pairs(L.log or {}) do line(id) end
+	ui.doneTotal:SetText(#lines > 0 and ("Spent %s in total."):format(Money(spent)) or "Nothing was bought on this list.")
+	for i, fs in ipairs(ui.doneLines) do fs:SetText(lines[i] or "") end
+end
+
+local function RefreshShop()
+	ui.shopLive:SetText(LiveText())
+	local L = ActiveList()
+	if not L then return end
+	ui.listBtn:SetText(L.name)
+	ui.trackCheck:SetChecked(L.track)
+	ui.shopBody:SetShown(not L.done)
+	ui.doneView:SetShown(L.done and true or false)
+	if L.done then
+		RefreshDone(L)
+		return
+	end
+	ui.pctText:SetText((L.pct or 80) .. "%")
+	ui.gotHeader:SetText(L.track and "Got" or "Amount")
+	ui.markBtn:SetShown(L.track)
+	if ListAllBought(L) then ui.markBtn:LockHighlight() else ui.markBtn:UnlockHighlight() end
+
 	local target = Target()
+	local cost, unknown = 0, false
 	local i = 1
-	for _, id in ipairs(db.order) do
-		local cfg = db.items[id]
+	for _, id in ipairs(L.order) do
+		local cfg = L.items[id]
 		local r = results[id]
-		local row = ui.watchRows[i]
+		local row = ui.shopRows[i]
 		row.itemID = id
 		row:Show()
 		local on = cfg.enabled ~= false
+		local done = ItemDone(L, cfg)
+		local typ, n = Typical(id)
+		local max = MaxFor(cfg, id)
 		row.on:SetChecked(on)
 		row.name:SetText(ItemName(id))
-		row.money.Set(cfg.max)
-		if not row.qty:HasFocus() then row.qty:SetText(tostring(cfg.qty)) end
-		-- The "Now" column: what's happening with this item right now.
+		if cfg.mode == "fixed" then
+			row.deal:SetText((cfg.max or 0) > 0 and Money(cfg.max) or "|cffff5555set price|r")
+		else
+			row.deal:SetText((cfg.pct or L.pct or 80) .. "%")
+		end
+		row.normal:SetText(typ and Money(typ) or ("|cff888888learning %d/%d|r"):format(n, MIN_SAMPLES))
+		-- "Now": what's happening with this item right now
+		local nr, ng, nb = 1, 1, 1
 		if not on then
 			row.now:SetText("|cff888888off|r")
-			row.name:SetTextColor(0.5, 0.5, 0.5)
-		elseif (cfg.max or 0) <= 0 then
-			row.now:SetText("|cffff5555set max|r")
-			row.name:SetTextColor(1, 1, 1)
+			nr, ng, nb = 0.5, 0.5, 0.5
+		elseif done then
+			row.now:SetText("|cffffd100done|r")
 		elseif r and r.typo then
 			row.now:SetText("|cffff5555typo?|r")
-			row.name:SetTextColor(1, 0.35, 0.35)
-		elseif db.countdown and Remaining(cfg) == 0 then
-			row.now:SetText("|cffffd100done|r")
-			row.name:SetTextColor(1, 1, 1)
+			nr, ng, nb = 1, 0.35, 0.35
+		elseif not max then
+			if cfg.mode == "fixed" then
+				row.now:SetText("|cffff5555set price|r")
+			else
+				row.now:SetText((r and r.cheapest) and (Money(r.cheapest) .. " |cff888888wait|r") or "|cff888888learning|r")
+			end
 		elseif r and r.avail > 0 then
-			row.now:SetText("|cff33ff33YES " .. r.avail .. "|r")
-			row.name:SetTextColor(0.3, 1, 0.3)
+			row.now:SetText("|cff33ff33YES|r " .. NowText(r.total / r.avail, typ))
+			nr, ng, nb = 0.3, 1, 0.3
 		elseif r and r.cheapest then
-			row.now:SetText(Money(r.cheapest))
-			row.name:SetTextColor(1, 1, 1)
+			row.now:SetText(NowText(r.cheapest, typ))
 		elseif r then
 			row.now:SetText("|cff888888none listed|r")
-			row.name:SetTextColor(1, 1, 1)
 		else
 			row.now:SetText("|cff888888...|r")
-			row.name:SetTextColor(1, 1, 1)
+		end
+		row.name:SetTextColor(nr, ng, nb)
+		if L.track then
+			row.got:SetText((done and "|cffffd100%d/%d|r" or "%d/%d"):format(cfg.got or 0, cfg.qty))
+		else
+			row.got:SetText(tostring(cfg.qty))
 		end
 		row.hl:SetShown(on and target == id)
 		row.sel:SetShown(editID == id and target ~= id)
+		if on and not done then
+			local price = (r and r.cheapest) or typ
+			if price then cost = cost + Remaining(cfg) * price else unknown = true end
+		end
 		i = i + 1
 	end
 	for j = i, MAX_ITEMS do
-		ui.watchRows[j].itemID = nil
-		ui.watchRows[j]:Hide()
+		ui.shopRows[j].itemID = nil
+		ui.shopRows[j]:Hide()
+	end
+	ui.emptyHint:SetShown(#L.order == 0)
+	if cost == 0 then
+		ui.costText:SetText("")
+	else
+		local label = cost > Spendable() and "|cffff5555Rest of list|r" or "|cffaaaaaaRest of list|r"
+		ui.costText:SetText(("%s ~ %s%s"):format(label, Money(cost), unknown and " +" or ""))
 	end
 
-	local cfg = editID and db.items[editID]
+	-- Edit strip
+	local cfg = editID and L.items[editID]
+	ui.stripHint:SetShown(not cfg)
+	ui.stripCtl:SetShown(cfg ~= nil)
 	if cfg then
-		local typ, n = Typical(editID)
-		local low = LowToday(editID)
+		local fixed = cfg.mode == "fixed"
+		ui.modeBtn:SetText(fixed and "Fixed price" or "% of normal")
+		ui.pctFrame:SetShown(not fixed)
+		ui.fixFrame:SetShown(fixed)
+		if fixed then
+			ui.fixMoney.Set(cfg.max or 0)
+		else
+			ui.itemPctText:SetText((cfg.pct or L.pct or 80) .. "%")
+			local max = MaxFor(cfg, editID)
+			ui.itemMaxText:SetText(max and ("= " .. Money(max)) or "|cff888888learning|r")
+		end
+		if not ui.itemQty:HasFocus() then ui.itemQty:SetText(tostring(cfg.qty)) end
 		local r = results[editID]
-		ui.editInfo:SetText(("|cffffd100%s|r   Typical: %s   Low today: %s   Cheapest now: %s"):format(
-			ItemName(editID),
-			typ and Money(typ) or ("learning " .. n .. "/" .. MIN_SAMPLES),
-			low and Money(low) or "-",
-			(r and r.cheapest) and Money(r.cheapest) or "-"))
-		for _, b in ipairs(ui.pctBtns) do b:SetEnabled(typ ~= nil) end
-	else
-		ui.editInfo:SetText("|cff888888Ticked items take turns. Click a name to see its prices and buy that one first.|r")
-		for _, b in ipairs(ui.pctBtns) do b:SetEnabled(false) end
+		ui.itemOk:SetShown((fixed and r and r.typo) and true or false)
 	end
 end
 
@@ -1461,10 +2138,12 @@ local function RefreshSettings()
 	ui.reserve.Set(db.reserve)
 	ui.speedText:SetText(("%.1f"):format(db.interval))
 	local active = 0
-	for _, id in ipairs(db.order) do
-		if db.items[id] and db.items[id].enabled ~= false then active = active + 1 end
+	local L = ActiveList()
+	for _, id in ipairs(L and L.order or {}) do
+		local cfg = L.items[id]
+		if cfg and cfg.enabled ~= false and not ItemDone(L, cfg) then active = active + 1 end
 	end
-	ui.speedNote:SetText(("Focus: your one item is checked every %.1fs. Watch List: %d items take turns, each about every %.1fs."):format(db.interval, active, db.interval * math.max(1, active)))
+	ui.speedNote:SetText(("Focus: your one item is checked every %.1fs. Shopping list: %d items take turns, each about every %.1fs."):format(db.interval, active, db.interval * math.max(1, active)))
 	ui.soundCheck:SetChecked(db.sound)
 	ui.autoCheck:SetChecked(db.autoStart)
 	ui.lockCheck:SetChecked(db.locked)
@@ -1527,7 +2206,7 @@ local function RefreshFocus()
 
 	-- The big YES / NO line: can I buy right now?
 	-- While you're typing a max, it warns straight away if the number looks like a typo.
-	local typingRef = typingMax and TypoRef(id, typingMax, r and r.cheapest)
+	local typingRef = typingMax and TypoRef(cfg, id, typingMax, r and r.cheapest)
 	local typoShown = typingRef or (not typingMax and r and r.typo)
 	ui.fOk:SetShown(typoShown and true or false)
 	ui.fDeal:SetWidth(typoShown and 365 or 450)
@@ -1592,7 +2271,7 @@ function HS.Refresh()
 	if not ui.frame or not db then return end
 	RefreshBuy()
 	if ui.panels.focus:IsShown() then RefreshFocus() end
-	if ui.panels.watch:IsShown() then RefreshWatch() end
+	if ui.panels.shop:IsShown() then RefreshShop() end
 	if ui.panels.settings:IsShown() then RefreshSettings() end
 	if ui.panels.history:IsShown() then RefreshHistory() end
 end
@@ -1628,7 +2307,6 @@ local function InitDB()
 	if type(HelpmeSniperDB) ~= "table" then HelpmeSniperDB = DeepCopy(DEFAULTS) end
 	db = HelpmeSniperDB
 	db.items = db.items or {}
-	db.order = db.order or {}
 	db.prices = db.prices or {}
 	db.history = db.history or {}
 	if (db.version or 1) < 2 then
@@ -1668,6 +2346,30 @@ local function InitDB()
 		db.pos = nil
 		db.version = 7
 	end
+	if db.version < 8 then
+		-- v0.7: the Watch List becomes a shopping list called "My list". Its items keep their
+		-- prices (as fixed prices) and amounts; the Focus item keeps its own settings.
+		db.lists = db.lists or {}
+		if #db.lists == 0 then
+			local L = NewListTable("My list")
+			for _, id in ipairs(db.order or {}) do
+				local old = db.items[id]
+				if old and #L.order < MAX_ITEMS then
+					L.items[id] = { kind = "list", mode = "fixed", max = old.max or 0, qty = old.qty or 20, enabled = old.enabled ~= false, got = 0, okMax = old.okMax }
+					L.order[#L.order + 1] = id
+					if id ~= db.focusItem then db.items[id] = nil end
+				end
+			end
+			db.lists[1] = L
+		end
+		db.order = nil
+		db.activeList = 1
+		if db.tab == "watch" then db.tab = "shop" end
+		db.version = 8
+	end
+	db.lists = db.lists or {}
+	if #db.lists == 0 then db.lists[1] = NewListTable("My list") end
+	if not db.lists[db.activeList or 1] then db.activeList = 1 end
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
 	end
@@ -1709,6 +2411,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		scanning = db.autoStart and true or false
 		HS.ShowTab(db.tab or "focus")
 		SetStatus(scanning and "Scanning..." or "Paused. Click Start.", 0.8, 0.8, 0.8)
+		if not db.seenWelcome then HS.ShowWelcome() end
 
 	elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
 		if nameSearch and nameSearch.sent and not nameSearch.waiting then
@@ -1728,6 +2431,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
 	elseif event == "AUCTION_HOUSE_CLOSED" then
 		HS.ClosePicker()
+		if ui.listMenu then ui.listMenu:Hide() end
 		if pending and pending.stage ~= "buying" then CancelQuote() end
 		ahOpen = false
 		scanning = false
@@ -1738,13 +2442,15 @@ ev:SetScript("OnEvent", function(_, event, ...)
 	elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
 		local itemID = ...
 		if awaiting and awaiting.id == itemID then awaiting = nil end
-		if db.items[itemID] and not pending then Evaluate(itemID) end
+		if Cfg(itemID) and not pending then Evaluate(itemID) end
 
 	elseif event == "COMMODITY_PRICE_UPDATED" then
 		local _, totalPrice = ...
 		if pending and pending.stage == "quoting" then
-			local cfg = db.items[pending.itemID]
-			local cap = (cfg and (cfg.max or 0) > 0) and (cfg.max * pending.qty) or pending.expected
+			-- Never pay more than what the addon showed you (already at or under your max). If
+			-- someone bought the cheap ones first, it cancels and searches again right away.
+			local cap = pending.expected
+			if pending.max then cap = math.min(cap, pending.max * pending.qty) end
 			-- Accept if the average price stays at or under your max and you can afford it.
 			-- If someone bought the cheapest ones first, the leftovers are fine as long as
 			-- they're still under your max.
@@ -1809,8 +2515,20 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			table.insert(db.history, 1, { t = time(), id = pending.itemID, qty = pending.qty, total = total })
 			while #db.history > 50 do table.remove(db.history) end
 			Print(("Bought %d %s for %s."):format(pending.qty, ItemName(pending.itemID), Money(total)))
-			local cfg = db.items[pending.itemID]
-			if cfg then
+			local cfg = pending.cfg
+			local L = pending.list
+			if cfg and cfg.kind == "list" then
+				-- Shopping list: count it (Track totals) and add it to the list's receipt.
+				if L and L.track then cfg.got = (cfg.got or 0) + pending.qty end
+				if L then
+					L.log = L.log or {}
+					local e = L.log[pending.itemID] or { qty = 0, spent = 0, normal = 0, spentN = 0 }
+					e.qty, e.spent = e.qty + pending.qty, e.spent + total
+					local typ = Typical(pending.itemID)
+					if typ then e.normal, e.spentN = e.normal + typ * pending.qty, e.spentN + total end
+					L.log[pending.itemID] = e
+				end
+			elseif cfg then
 				ResetIfStale(cfg)
 				cfg.bought = (cfg.bought or 0) + pending.qty
 				cfg.boughtAt = time()
@@ -1837,7 +2555,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				-- Same for the listings table on the Focus page, so it doesn't show what you just bought.
 				left = pending.qty
 				for _, l in ipairs(r.listings or {}) do
-					if l.price <= (cfg.max or 0) then
+					if l.price <= (r.max or 0) then
 						local used = math.min(math.max(0, l.qty), left)
 						l.qty = l.qty - used
 						left = left - used
@@ -1847,8 +2565,11 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			else
 				results[id] = nil
 			end
-			if cfg and db.countdown and Remaining(cfg) == 0 then
-				SetStatus(("Got all %d %s. Count down done."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
+			local tracked = cfg and ((cfg.kind == "list" and L and L.track) or (cfg.kind ~= "list" and db.countdown))
+			if L and L == ActiveList() and ListAllBought(L) then
+				SetStatus("Everything on this list is bought! Click Mark complete when you're ready.", 0.3, 1, 0.3)
+			elseif tracked and (cfg.kind == "list" and (cfg.got or 0) >= cfg.qty or cfg.kind ~= "list" and Remaining(cfg) == 0) then
+				SetStatus(("Got all %d %s."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
 			elseif more > 0 then
 				SetStatus(("Bought %d! %d more under your max: click again."):format(pending.qty, more), 0.3, 1, 0.3)
 			else
@@ -1904,25 +2625,32 @@ SlashCmdList.HELPMESNIPER = function(msg)
 			return
 		end
 		HS.AddItem(id)
-		local cfg = db.items[id]
-		if cfg and price then cfg.max = price end
+		local L = ActiveList()
+		local cfg = L and L.items[id]
+		if cfg and price then cfg.mode, cfg.max = "fixed", price end
 		if cfg and qty and qty >= 1 then cfg.qty = math.floor(qty) end
-		if cfg then Print(("%s: up to %d at %s each."):format(ItemName(id), cfg.qty, Money(cfg.max))) end
+		if cfg then
+			local max = MaxFor(cfg, id)
+			Print(("%s: up to %d at %s each."):format(ItemName(id), cfg.qty, max and Money(max) or "the % of normal (still learning the normal price)"))
+		end
 
 	elseif cmd == "remove" then
 		local id = hasLink and linkID or tonumber(args[2])
-		if id and db.items[id] then
+		local L = ActiveList()
+		if id and L and L.items[id] then
 			HS.RemoveItem(id)
-			Print("Stopped watching " .. ItemName(id) .. ".")
+			Print("Removed " .. ItemName(id) .. " from the list.")
 		else
-			Print("That item isn't on the watch list.")
+			Print("That item isn't on the open shopping list.")
 		end
 
 	elseif cmd == "list" then
-		if #db.order == 0 then Print("Watch list is empty.") end
-		for _, id in ipairs(db.order) do
-			local cfg = db.items[id]
-			Print(("%s (ID %d): up to %d at %s each%s"):format(ItemName(id), id, cfg.qty, Money(cfg.max), cfg.enabled == false and " (paused)" or ""))
+		local L = ActiveList()
+		if not L or #L.order == 0 then Print("The open shopping list is empty.") end
+		for _, id in ipairs(L and L.order or {}) do
+			local cfg = L.items[id]
+			local max = MaxFor(cfg, id)
+			Print(("%s (ID %d): up to %d at %s each%s"):format(ItemName(id), id, cfg.qty, max and Money(max) or "?", cfg.enabled == false and " (off)" or ""))
 		end
 
 	elseif cmd == "start" then
