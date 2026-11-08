@@ -39,7 +39,7 @@ Shift-click the - and + buttons to change the amount by 10.
 ## Good to know
 
 - The game needs a real click or key press to start each purchase, so the addon never buys without you clicking. If the game ever refuses the automatic last step, the addon switches to "click again to buy" by itself.
-- The window is locked in place by default so fast clicking can't drag it. Unlock it in Settings to move it.
+- The window opens just right of the auction house so it doesn't cover it. Drag it anywhere and it remembers the spot; tick "Lock window position" in Settings to pin it.
 - WoW allows about 100 auction searches per minute across all addons combined. Running TSM's Sniper at the same time slows both down.
 - Only works for items sold by quantity, not gear or bags.
 

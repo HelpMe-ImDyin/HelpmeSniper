@@ -1,4 +1,4 @@
--- Helpme Sniper v0.6
+-- Helpme Sniper v0.6.1
 -- Personal quick-buy sniper for stackable auction house items (cloth, dye, herbs).
 -- Standalone: scans the auction house itself, no other addons needed.
 --
@@ -25,11 +25,11 @@ BINDING_NAME_HELPMESNIPER_BUY = "Buy (one press; safe to spam)"
 
 -- Prices are stored in copper (100 copper = 1 silver, 10000 copper = 1 gold).
 local DEFAULTS = {
-	version = 6,
+	version = 7,
 	interval = 0.6,
 	autoStart = true,
 	sound = true,
-	locked = true, -- so fast clicking can't drag the window around
+	locked = false, -- drag the window anywhere; tick "Lock window position" in Settings to pin it
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
 	countdown = true, -- quantity is a hard total (untick to buy up to the quantity on every click)
 	resetMinutes = 5, -- count down starts over after this many minutes without buying that item
@@ -1048,6 +1048,22 @@ local function BuildFocusPanel(p)
 	end
 end
 
+-- Where the window opens: where you last dragged it, otherwise just right of the
+-- auction house window so it never covers it.
+function HS.PlaceWindow()
+	local f = ui.frame
+	if not f then return end
+	f:ClearAllPoints()
+	local ah = _G.AuctionHouseFrame or _G.AuctionFrame
+	if db.pos then
+		f:SetPoint(db.pos[1], UIParent, db.pos[2], db.pos[3], db.pos[4])
+	elseif ah then
+		f:SetPoint("TOPLEFT", ah, "TOPRIGHT", 12, 0)
+	else
+		f:SetPoint("RIGHT", UIParent, "RIGHT", -40, 0)
+	end
+end
+
 local function BuildFrame()
 	local f = CreateFrame("Frame", "HelpmeSniperFrame", UIParent, "BackdropTemplate")
 	ui.frame = f
@@ -1060,14 +1076,16 @@ local function BuildFrame()
 	f:SetScript("OnDragStart", function(self) if not db.locked then self:StartMoving() end end)
 	f:SetScript("OnDragStop", function(self)
 		self:StopMovingOrSizing()
-		local pnt, _, rp, x, y = self:GetPoint()
-		db.pos = { pnt, rp, x, y }
+		-- Remember where you put it, measured from the screen's bottom-left corner.
+		local left, top = self:GetLeft(), self:GetTop()
+		if left and top then
+			db.pos = { "TOPLEFT", "BOTTOMLEFT", left, top }
+			self:ClearAllPoints()
+			self:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+		end
+		if self.SetUserPlaced then self:SetUserPlaced(false) end -- the addon saves the spot itself
 	end)
-	if db.pos then
-		f:SetPoint(db.pos[1], UIParent, db.pos[2], db.pos[3], db.pos[4])
-	else
-		f:SetPoint("RIGHT", UIParent, "RIGHT", -40, 0)
-	end
+	HS.PlaceWindow()
 	f:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
 	f:SetBackdropColor(0.05, 0.06, 0.07, 0.95)
 	f:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
@@ -1423,6 +1441,13 @@ local function InitDB()
 		if db.tab == "snipe" then db.tab = "watch" end
 		db.version = 6
 	end
+	if db.version < 7 then
+		-- v0.6.1: the window can be dragged again, and it opens beside the auction house
+		-- (any old saved spot is forgotten once so it starts out of the way).
+		db.locked = false
+		db.pos = nil
+		db.version = 7
+	end
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
 	end
@@ -1457,6 +1482,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 	if event == "AUCTION_HOUSE_SHOW" then
 		ahOpen = true
 		results = {}
+		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
 		HS.ShowTab(db.tab or "focus")
