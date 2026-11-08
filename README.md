@@ -4,7 +4,7 @@ A small World of Warcraft **Forever** addon for buying auction house materials f
 
 You set a max price and how many you want. The addon searches the auction house on its own and shows a big **YES** the moment something is listed at or under your price. Click BUY: the addon gets the exact price and buys straight away if it's still at or under your max. Keep clicking to keep buying; it doesn't wait for a new search between buys. If someone beats you and the price comes back higher, it cancels automatically, so you never pay more than your max.
 
-It doesn't need TSM or any other addon.
+It works on its own; you don't need any other addon.
 
 ## Install (auto-updates)
 
@@ -21,7 +21,13 @@ The window opens just right of the auction house window. Drag it anywhere and it
 
 ### Adding items
 
-In either item box: start typing the name (after 3 letters, matching items for sale drop down, like a search bar; click one or use Up/Down and Enter), drop an item on "Drop item here", shift-click it into the box, or type its item ID.
+In either item box: start typing the name (after 2 letters, matching items drop down straight away, like a search bar; click one or use Up/Down and Enter), drop an item on "Drop item here", shift-click it into the box, or type its item ID.
+
+The names come from the addon's own saved list of everything sold by quantity on the auction house. When you open the auction house, and every 15 minutes while it's open, the addon copies the whole auction house in one go (the game allows one copy every 15 minutes). It isn't a search, so nothing changes in the auction house window. If an item isn't in the list yet, type its name and press Enter to search the auction house for it.
+
+### Prices
+
+Each copy also saves prices: the cheapest price, how many are listed, and a market price worked out from the cheaper listings (ignoring a few silly ones). The **normal price** combines the last 14 days, with recent days counting most. Hover any item (in your bags, a chat link or the search list) to see its normal price and the cheapest price from the last copy.
 
 ### Focus: one item, as fast as possible
 
@@ -32,14 +38,14 @@ For racing for a deal. Only that item is searched, every 0.6 seconds.
 
 ### Shopping Lists: fill a list at good prices
 
-For shopping without racing, like TSM groups.
+For filling a list of materials at good prices, without racing.
 - **Several lists** ("Tailoring 75–150", "Dyes"...). Click the list name to switch lists, see completed ones, or rename, copy or delete. Only the open list is searched, which keeps it fast.
 - **Deals at X% of normal:** an item is a deal when it's at or under that share of its normal price (80% by default). Click an item to give it its own % or a fixed price.
 - **Columns:** On, Deal at, Normal (its usual price), Now (cheapest price and how far from normal, YES when it's a deal), Got.
 - **Track totals** (tick box): counts what you buy ("40/180") and never buys past each amount. It remembers until you mark the list complete, even after logging off. Untick it to just buy freely.
 - **Mark complete:** the list stops searching and keeps a receipt (what you bought, what you paid, how that compares with normal). **Shop again** reopens it with the same items and the counts at zero, so you never re-add items.
 - **Rest of list:** roughly what the rest would cost at today's prices; red when it's more than you can spend.
-- Normal prices take about 10 minutes of watching to learn. Until then, % items show "learning" and won't buy; fixed-price items work straight away.
+- Items get a normal price a few seconds after you first open the auction house. An item nobody had listed shows "learning" and won't buy until it's been watched for a while; fixed-price items work straight away.
 
 ### Buying
 
@@ -66,7 +72,7 @@ Shift-click the - and + buttons to change an amount by 10.
 
 - The game needs a real click or key press to start each purchase, so the addon never buys without you clicking. If the game ever refuses the automatic last step, the addon switches to "click again to buy" by itself.
 - The auction house handles one purchase at a time, so items are bought one after another.
-- WoW allows about 100 auction searches per minute across all addons combined. Running TSM's Sniper at the same time slows both down.
+- WoW allows about 100 auction searches per minute, shared by everything you run. If another addon or app is scanning the auction house at the same time, both slow down.
 - Only works for items sold by quantity, not gear or bags.
 - Updating from an older version: your Watch List becomes a shopping list called "My list", with the same items, prices and amounts.
 

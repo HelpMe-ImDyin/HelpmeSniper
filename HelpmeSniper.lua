@@ -42,6 +42,9 @@ local DEFAULTS = {
 	activeList = 1,
 	prices = {},
 	history = {},
+	names = {}, -- [itemID] = name of everything sold by quantity on the auction house
+	notSold = {}, -- [itemID] = true: on the auction house but not sold by quantity (never checked again)
+	market = {}, -- [itemID] = { min, qty, at, d = { [day] = { sum, count } } } from the full copies
 }
 
 local MAX_ITEMS = 8 -- items per shopping list
@@ -70,7 +73,10 @@ local pending -- { itemID, qty, expected, quote, stage = quoting|ready|waitline|
 local selected, editID
 local dealMsgID -- the item whose "Deal:" message is on the status line, so it can be cleared
 local typingMax -- the Focus max price while it's being typed (for the live typo warning)
-local nameSearch -- an item name you typed that's being looked up on the auction house
+local nameSearch -- an item name you typed that's being looked up on the auction house (Enter)
+local full -- the full auction house copy in progress (see "Full scan")
+local namesDirty, namesRefreshAt = false, 0 -- new names learned: refresh the open list
+local keyWaiting = {} -- [itemID] = auction house item whose name the game is still loading
 local ui = {}
 
 -- ============================================================================
@@ -275,9 +281,115 @@ local function RecordPrice(id, price)
 	end
 end
 
--- Typical price = the middle value of the cheapest prices seen over the last 3 days.
--- Returns nil (still learning) until there are enough scans.
-local function Typical(id)
+-- ============================================================================
+-- Market prices from the full auction house copy (see "Full scan" below).
+-- Each copy gives every item one price, worked out from its cheaper listings so a few silly
+-- listings don't skew it. Each day's copies are averaged, and the normal price weighs the
+-- last 14 days, recent days most (a day's weight halves about every 2 days).
+-- ============================================================================
+
+local MARKET_DAYS = 14
+local MARKET_RECENT_DAYS = 3 -- a normal price needs a copy from the last 3 days
+local MARKET_MIN_QTY = 3 -- copies with fewer listed than this are too thin to judge a price
+
+local function Day()
+	return math.floor(time() / 86400)
+end
+
+-- One copy's price for one item. flat = { unitPrice, quantity, unitPrice, quantity, ... }
+-- 1. cheapest first, and only the cheapest 30% of what's listed
+-- 2. after the first 15%, stop at a price jump of 20% or more
+-- 3. drop prices far from the rest (more than 1.5 standard deviations)
+-- 4. average what's left (by quantity)
+-- Returns the price, the cheapest price, and how many are listed.
+local function ScanValue(flat)
+	local a = {}
+	for j = 1, #flat, 2 do a[#a + 1] = { flat[j], flat[j + 1] } end
+	table.sort(a, function(x, y) return x[1] < y[1] end)
+	local total = 0
+	for _, e in ipairs(a) do total = total + e[2] end
+	local kept, seen = {}, 0
+	for k, e in ipairs(a) do
+		if k > 1 then
+			if seen >= 0.30 * total then break end
+			if seen >= 0.15 * total and e[1] >= 1.2 * a[k - 1][1] then break end
+		end
+		kept[#kept + 1] = e
+		seen = seen + e[2]
+	end
+	local w, s = 0, 0
+	for _, e in ipairs(kept) do
+		w = w + e[2]
+		s = s + e[1] * e[2]
+	end
+	local mean = s / w
+	local var = 0
+	for _, e in ipairs(kept) do var = var + e[2] * (e[1] - mean) ^ 2 end
+	local sd = math.sqrt(var / w)
+	local w2, s2 = 0, 0
+	for _, e in ipairs(kept) do
+		if math.abs(e[1] - mean) <= 1.5 * sd then
+			w2 = w2 + e[2]
+			s2 = s2 + e[1] * e[2]
+		end
+	end
+	return (w2 > 0 and s2 / w2 or mean), a[1][1], total
+end
+
+-- Saves one copy's price for an item.
+local function SaveScanPrice(id, flat)
+	if #flat < 2 then return end
+	local value, cheapest, total = ScanValue(flat)
+	value = math.floor(value + 0.5)
+	local m = db.market[id]
+	if not m then
+		m = { d = {} }
+		db.market[id] = m
+	end
+	m.min, m.qty, m.at = math.floor(cheapest + 0.5), total, time()
+	if total < MARKET_MIN_QTY then return end -- shows in tooltips, but doesn't count toward normal
+	local day = Day()
+	local v = m.d[day]
+	if v then
+		v[1], v[2] = v[1] + value, v[2] + 1
+	else
+		m.d[day] = { value, 1 }
+	end
+	for d in pairs(m.d) do
+		if day - d > MARKET_DAYS then m.d[d] = nil end
+	end
+end
+
+-- The normal price from the copies of the last 14 days, or nil if it has none.
+local function MarketValue(id)
+	local m = db.market and db.market[id]
+	if not m or not m.d then return nil end
+	local today = Day()
+	local sumW, sumV, recent = 0, 0, false
+	for day, v in pairs(m.d) do
+		local age = today - day
+		if age >= 0 and age <= MARKET_RECENT_DAYS then recent = true end
+		if age >= 0 and age <= MARKET_DAYS and v[2] > 0 then
+			local wt = 0.5 ^ (age / 2)
+			sumW = sumW + wt
+			sumV = sumV + wt * v[1] / v[2]
+		end
+	end
+	if sumW == 0 or not recent then return nil end
+	return math.max(1, math.floor(sumV / sumW + 0.5))
+end
+
+-- "12 min", "3 h", "2 days"
+local function Ago(t)
+	local s = math.max(0, time() - (t or 0))
+	if s < 3600 then return math.max(1, math.floor(s / 60)) .. " min" end
+	if s < 172800 then return math.floor(s / 3600) .. " h" end
+	return math.floor(s / 86400) .. " days"
+end
+
+-- Normal price: from the full auction house copies when there are any. Otherwise the middle
+-- value of the cheapest prices seen over the last 3 days, or nil (still learning).
+local function SampleMedian(id)
 	local list = db.prices[id]
 	if not list then return nil, 0 end
 	local cutoff = time() - PRICE_KEEP_SECONDS
@@ -290,6 +402,16 @@ local function Typical(id)
 	local n = #vals
 	if n % 2 == 1 then return vals[(n + 1) / 2], n end
 	return math.floor((vals[n / 2] + vals[n / 2 + 1]) / 2), n
+end
+
+local function Typical(id)
+	local mv = MarketValue(id)
+	local med, n = SampleMedian(id)
+	-- Safety: never more than 1.5x what the fast searching has seen, so one odd copy
+	-- (say a few overpriced listings) can't make a high price look normal.
+	if mv and med then return math.min(mv, math.floor(med * 1.5)), n end
+	if mv then return mv, MIN_SAMPLES end
+	return med, n
 end
 
 local function LowToday(id)
@@ -496,11 +618,15 @@ local function Tick()
 	if not db or not ahOpen then return end
 	local now = GetTime()
 	if HS.UpdateAge then HS.UpdateAge(now) end
-	-- Typed item names: search once the typing pause is over and the line is free
-	-- (never in the middle of a purchase).
+	if namesDirty and now - namesRefreshAt > 0.5 then
+		namesRefreshAt = now
+		HS.RefreshNames()
+	end
+	-- A name you pressed Enter on that isn't in the item list: search the auction house once
+	-- the line is free (never in the middle of a purchase).
 	if nameSearch and not pending then
 		if not nameSearch.sent then
-			if now >= nameSearch.due and LineReady() then HS.SendNameSearch() end
+			if now >= nameSearch.due and LineReady() and (not Target() or now - (nameSearch.made or 0) > 3) then HS.SendNameSearch() end
 		elseif not nameSearch.waiting and now - nameSearch.sent > 5 then
 			local s = nameSearch
 			nameSearch = nil
@@ -524,6 +650,8 @@ local function Tick()
 		end
 		return -- no searching while a purchase is in progress
 	end
+	if not full then HS.StartFullScan() end
+	if full and HS.FullScanStep(now) then return end
 	if not scanning and not priorityID then return end
 	if not CanSend(now) then return end
 	local id = NextItem()
@@ -887,8 +1015,282 @@ local function MoneyBoxes(parent, x, y, onCommit, onChange)
 end
 
 -- ============================================================================
--- Find an item by typing its name, like a search bar: after 3 letters a list of matching
--- items for sale drops down and updates as you type. Click one, or use Up/Down + Enter.
+-- Full scan: one request copies the whole auction house (every item, how many, the price).
+-- It isn't a search, so nothing changes in the auction house window. The game allows one
+-- copy every 15 minutes per account. Each copy updates the item name list (everything sold
+-- by quantity; gear and bags are skipped) and the market prices.
+-- ============================================================================
+
+local FULL_SCAN_EVERY = 15 * 60 + 10 -- the game's limit is one copy per 15 minutes
+local SCAN_WAIT = 90 -- no copy after this many seconds: give up until the next turn
+local SCAN_RETRY = 60 -- the request itself errored: try again after this many seconds
+local READ_BATCH = 500 -- auctions read per tick (spread out so the game doesn't stutter)
+local CALC_BATCH = 150 -- items worked out per tick
+local GEAR_CLASSES = { [1] = true, [2] = true, [4] = true, [17] = true } -- bags, weapons, armor, pets
+local scanRetryAt = 0
+local gearCache = {} -- [itemID] = true/false for this session
+local lowerNames = {} -- [itemID] = lowercase name for this session (fast typing search)
+local nameWait = {} -- [itemID] = true while the game loads an item's name
+
+local function IsGearID(id)
+	local cached = gearCache[id]
+	if cached ~= nil then return cached end
+	local instant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+	if not instant then return false end
+	local classID = select(6, instant(id))
+	if classID == nil then return false end -- unknown yet: check again next time
+	cached = GEAR_CLASSES[classID] == true
+	gearCache[id] = cached
+	return cached
+end
+
+-- The item's name if it's sold by quantity, false if it isn't, nil if the game hasn't loaded it.
+local function NameIfStackable(id)
+	local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+	local name, _, _, _, _, _, _, stack = getInfo(id)
+	if not name or not stack then return nil end
+	if stack > 1 then return name end
+	return false
+end
+
+local function SetName(id, name)
+	if name == false then db.notSold[id] = true end
+	if name then db.notSold[id] = nil end
+	if name ~= nil then lowerNames[id] = nil end
+	if name and db.names[id] ~= name then
+		db.names[id] = name
+		namesDirty = true
+	elseif name == false and db.names[id] then
+		db.names[id] = nil
+		namesDirty = true
+	end
+end
+
+-- True for things sold by quantity (cloth, herbs, dye...), false for gear, bags and pets.
+local function IsCommodityInfo(info)
+	if info.isCommodity ~= nil then return info.isCommodity end
+	return not info.isEquipment and not info.isPet
+end
+
+-- Remembers a name from an auction house search (the Enter search, or your own searches).
+local function LearnKey(key)
+	local id = key and key.itemID
+	if not id or id == 0 then return end
+	if IsGearID(id) then
+		keyWaiting[id] = nil
+		return
+	end
+	local info = C_AuctionHouse.GetItemKeyInfo and C_AuctionHouse.GetItemKeyInfo(key)
+	if not info or not info.itemName or info.itemName == "" then
+		keyWaiting[id] = key -- the game is still loading it: ITEM_KEY_ITEM_INFO_RECEIVED tries again
+		return
+	end
+	keyWaiting[id] = nil
+	SetName(id, IsCommodityInfo(info) and info.itemName or false)
+end
+
+local function LearnBrowse(list)
+	if type(list) ~= "table" then return end
+	for _, res in ipairs(list) do LearnKey(res.itemKey) end
+end
+
+-- Items the addon already knows (your lists, your Focus item, items it has priced).
+local function SeedNames()
+	local function add(id)
+		if type(id) ~= "number" or db.names[id] then return end
+		local name = C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(id)
+		if name and name ~= "" then
+			db.names[id] = name
+		elseif C_Item and C_Item.RequestLoadItemDataByID then
+			C_Item.RequestLoadItemDataByID(id) -- there next time
+		end
+	end
+	for id in pairs(db.prices) do add(id) end
+	for id in pairs(db.items) do add(id) end
+	for _, L in ipairs(db.lists) do
+		for id in pairs(L.items) do add(id) end
+	end
+end
+
+-- Starts a copy if the last one was over 15 minutes ago (checked often while the AH is open).
+function HS.StartFullScan()
+	if full or not ahOpen or not C_AuctionHouse.ReplicateItems then return end
+	if db.scanAt and time() - db.scanAt < FULL_SCAN_EVERY then return end
+	-- One request per 15 minutes, even if the last one never arrived (the game allows no more).
+	if db.scanAskedAt and time() - db.scanAskedAt < FULL_SCAN_EVERY then return end
+	if GetTime() < scanRetryAt then return end
+	full = { stage = "ask", t = GetTime() + 2 } -- 2s: let the auction house window settle first
+end
+
+local function FailScan(retrySoon)
+	full = nil
+	if retrySoon then scanRetryAt = GetTime() + SCAN_RETRY end
+	namesDirty = true
+end
+
+local function FinishScan()
+	local count = full.count or 0
+	full = nil
+	db.scanAt = time()
+	namesDirty = true
+	if not pending and not dealMsgID then
+		SetStatus(("Auction house copied: %d items priced."):format(count), 0.6, 0.8, 1)
+	end
+	HS.Refresh()
+end
+
+-- The copy arrived (REPLICATE_ITEM_LIST_UPDATE).
+function HS.FullScanArrived()
+	if not full and ahOpen and db.scanAskedAt and time() - db.scanAskedAt < 180
+		and (not db.scanAt or db.scanAt < db.scanAskedAt) then
+		full = { stage = "wait", t = GetTime() } -- it came late, but it's still good
+	end
+	if not full or full.stage ~= "wait" then return end
+	local n = C_AuctionHouse.GetNumReplicateItems and C_AuctionHouse.GetNumReplicateItems() or 0
+	if n <= 0 then
+		FailScan()
+		return
+	end
+	full.stage, full.i, full.n, full.auctions = "read", 0, n, {}
+end
+
+-- Called by Tick. Returns true when it used the auction house line this time.
+function HS.FullScanStep(now)
+	if full.stage == "ask" then
+		if now < full.t or not LineReady() or Target() then return false end
+		if not pcall(C_AuctionHouse.ReplicateItems) then
+			FailScan(true)
+			return false
+		end
+		db.scanAskedAt = time()
+		full.stage, full.t = "wait", now
+		lastSend = now
+		return true
+	elseif full.stage == "wait" then
+		if now - full.t > SCAN_WAIT then FailScan() end
+	elseif full.stage == "read" then
+		local stop = math.min(full.n, full.i + READ_BATCH)
+		for i = full.i, stop - 1 do
+			local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, id = C_AuctionHouse.GetReplicateItemInfo(i)
+			if id and count and count > 0 and buyout and buyout > 0 and not IsGearID(id) then
+				local flat = full.auctions[id]
+				if not flat then
+					flat = {}
+					full.auctions[id] = flat
+				end
+				flat[#flat + 1] = buyout / count
+				flat[#flat + 1] = count
+			end
+		end
+		full.i = stop
+		if stop >= full.n then
+			full.ids = {}
+			for id in pairs(full.auctions) do full.ids[#full.ids + 1] = id end
+			full.stage, full.k, full.count = "calc", 0, 0
+		end
+	elseif full.stage == "calc" then
+		for _ = 1, CALC_BATCH do
+			full.k = full.k + 1
+			local id = full.ids[full.k]
+			if not id then
+				FinishScan()
+				return false
+			end
+			-- Names it already knows (or knows aren't sold by quantity) are never looked up again.
+			---@type string|false|nil
+			local name = db.names[id]
+			if name ~= nil and not db.market[id] then
+				local check = NameIfStackable(id) -- first price for it: make sure it's sold by quantity
+				if check ~= nil then name = check end
+			end
+			if name == nil and db.notSold[id] then name = false end
+			if name == nil then name = NameIfStackable(id) end
+			if name == nil then
+				nameWait[id] = true -- asking for it loads it; GET_ITEM_INFO_RECEIVED fills it in
+			end
+			SetName(id, name)
+			if name ~= false then
+				SaveScanPrice(id, full.auctions[id])
+				full.count = full.count + 1
+			elseif db.market[id] then
+				db.market[id] = nil -- not sold by quantity
+			end
+		end
+	end
+	return false
+end
+
+-- An item's details finished loading (GET_ITEM_INFO_RECEIVED).
+function HS.ItemLoaded(id)
+	if not nameWait[id] then return end
+	local name = NameIfStackable(id)
+	if name == nil then return end
+	nameWait[id] = nil
+	SetName(id, name)
+	if name == false then db.market[id] = nil end
+end
+
+-- Item tooltips (bags, chat links, the search list): one line with the normal price and
+-- the cheapest price from the last copy.
+local function AddPriceLine(tooltip, id)
+	if not db or not id or not tooltip or not tooltip.AddLine then return end
+	if tooltip.IsForbidden and tooltip:IsForbidden() then return end
+	local typ = MarketValue(id)
+	local m = db.market[id]
+	if not typ and not (m and m.min) then return end
+	local parts = {}
+	if typ then parts[#parts + 1] = "normal " .. Money(typ) end
+	if m and m.min then parts[#parts + 1] = ("cheapest %s, %d listed (%s ago)"):format(Money(m.min), m.qty or 0, Ago(m.at)) end
+	tooltip:AddLine("|cff33ff99Helpme Sniper:|r |cffffffff" .. table.concat(parts, " · ") .. "|r")
+end
+
+if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum and Enum.TooltipDataType and Enum.TooltipDataType.Item then
+	TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
+		AddPriceLine(tooltip, data and data.id)
+	end)
+elseif GameTooltip and GameTooltip.HookScript then
+	local function OnItem(tooltip)
+		local _, link = tooltip:GetItem()
+		AddPriceLine(tooltip, link and tonumber(link:match("item:(%d+)")))
+	end
+	GameTooltip:HookScript("OnTooltipSetItem", OnItem)
+	if ItemRefTooltip then ItemRefTooltip:HookScript("OnTooltipSetItem", OnItem) end
+end
+
+-- Names containing what you typed: names that start with it first, then a word that starts
+-- with it ("cloth" finds "Wool Cloth"), then the rest; shorter names first.
+local function LocalMatches(q)
+	local lower = q:lower()
+	local matches = {}
+	for id, name in pairs(db.names) do
+		local ln = lowerNames[id]
+		if not ln then
+			ln = name:lower()
+			lowerNames[id] = ln
+		end
+		local at = ln:find(lower, 1, true)
+		if at then
+			local rank = 2
+			if at == 1 then
+				rank = 0
+			elseif ln:sub(at - 1, at - 1) == " " then
+				rank = 1
+			end
+			local m = db.market[id]
+			matches[#matches + 1] = { id = id, name = name, rank = rank, qty = m and m.qty, price = m and m.min }
+		end
+	end
+	table.sort(matches, function(a, b)
+		if a.rank ~= b.rank then return a.rank < b.rank end
+		if #a.name ~= #b.name then return #a.name < #b.name end
+		return a.name < b.name
+	end)
+	return matches
+end
+
+-- ============================================================================
+-- Find an item by typing its name, like a search bar: after 2 letters a list of matching
+-- items drops down straight away and updates as you type. Click one, or use Up/Down + Enter.
 -- ============================================================================
 
 local SUGGEST_ROWS = 8
@@ -924,6 +1326,14 @@ local function Picker()
 		b:SetScript("OnClick", function(self)
 			if self.itemID then HS.PickSuggestion(self.itemID) end
 		end)
+		b:SetScript("OnEnter", function(self)
+			if self.itemID and GameTooltip.SetItemByID then
+				GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+				GameTooltip:SetItemByID(self.itemID)
+				GameTooltip:Show()
+			end
+		end)
+		b:SetScript("OnLeave", function() GameTooltip:Hide() end)
 		pk.rows[i] = b
 	end
 	pk:Hide()
@@ -990,26 +1400,45 @@ function HS.PickSuggestion(id)
 	if onPick and id then onPick(id) end
 end
 
--- Runs on every letter typed into an item box.
+-- Runs on every letter typed into an item box: matching names drop down straight away from
+-- the addon's own item list (no auction house search, so nothing changes in its window).
 function HS.NameTyped(box, onPick)
 	local q = (box:GetText() or ""):match("^%s*(.-)%s*$")
-	if #q < 3 or q:find("item:") or q:match("^%d+$") then
+	if #q < 2 or q:find("item:") or q:match("^%d+$") then
 		HS.ClosePicker()
 		return
 	end
-	if not ahOpen then return end
-	-- Wait for a short pause in typing, then search (so it isn't one search per letter).
-	nameSearch = { text = q, lower = q:lower(), box = box, onPick = onPick, due = GetTime() + 0.35 }
-	ShowSuggestions(box, onPick, "Searching...", nil)
+	nameSearch = nil -- you kept typing: forget any auction house search for the old text
+	local matches = LocalMatches(q)
+	local title
+	if #matches > 0 then
+		title = "Click one, or use Up/Down and Enter"
+	elseif full then
+		title = "Copying the auction house, one moment..."
+	else
+		title = "Not in the list yet. Press Enter to search."
+	end
+	ShowSuggestions(box, onPick, title, matches)
+	ui.picker.fromAH = nil
+end
+
+-- Refreshes the open list when new names have been learned (Tick calls this).
+function HS.RefreshNames()
+	namesDirty = false
+	local pk = ui.picker
+	if not (pk and pk:IsShown() and pk.box and pk.box:HasFocus()) then return end
+	if nameSearch or pk.fromAH or (pk.count or 0) >= SUGGEST_ROWS then return end
+	if (pk.selected or 1) > 1 or pk:IsMouseOver() then return end -- you're choosing: don't move the rows
+	HS.NameTyped(pk.box, pk.onPick)
 end
 
 -- Enter in an item box: an ID or link is used straight away; otherwise the highlighted
--- suggestion; with no list yet, it searches now and takes a clear match.
+-- suggestion; with nothing in the list, it searches the auction house and takes a clear match.
 function HS.NameEnter(box, onPick)
-	local text = box:GetText()
+	local text = box:GetText() or ""
 	local id = ItemIDFromText(text)
 	local pk = ui.picker
-	if not id and pk and pk:IsShown() and pk.box == box and not nameSearch and pk.selected then
+	if not id and pk and pk:IsShown() and pk.box == box and not nameSearch and (pk.count or 0) > 0 and pk.selected then
 		id = pk.rows[pk.selected].itemID
 	end
 	if id then
@@ -1019,11 +1448,10 @@ function HS.NameEnter(box, onPick)
 		onPick(id)
 		return
 	end
-	HS.NameTyped(box, onPick)
-	if nameSearch then
-		nameSearch.due = 0
-		nameSearch.enter = true
-	end
+	local q = text:match("^%s*(.-)%s*$")
+	if #q < 2 or not ahOpen then return end
+	nameSearch = { text = q, lower = q:lower(), box = box, onPick = onPick, due = 0, enter = true, made = GetTime() }
+	ShowSuggestions(box, onPick, "Searching the auction house...", {})
 end
 
 -- Up/Down arrows move through the suggestions.
@@ -1056,18 +1484,17 @@ end
 function HS.FinishNameSearch(s)
 	if nameSearch ~= s then return end -- you kept typing: a newer search replaces this one
 	nameSearch = nil
-	local seen, matches, exact = {}, {}, nil
+	local seen, matches, exact, loading = {}, {}, nil, 0
 	for _, res in ipairs(C_AuctionHouse.GetBrowseResults() or {}) do
 		local id = res.itemKey and res.itemKey.itemID
 		if id and not seen[id] then
 			seen[id] = true
-			local info = C_AuctionHouse.GetItemKeyInfo and C_AuctionHouse.GetItemKeyInfo(res.itemKey)
-			local name = (info and info.itemName) or ItemName(id)
-			local lower = name:lower()
-			-- Gear and bags can't be bought by quantity, so leave them out.
-			local status = C_AuctionHouse.GetItemCommodityStatus and C_AuctionHouse.GetItemCommodityStatus(id)
-			local gear = Enum and Enum.ItemCommodityStatus and status == Enum.ItemCommodityStatus.Item
-			if not gear and lower:find(s.lower, 1, true) then
+			-- Learns the name; gear and bags can't be bought by quantity, so they get no name here.
+			LearnKey(res.itemKey)
+			local name = db.names[id]
+			if not name and keyWaiting[id] then loading = loading + 1 end
+			local lower = name and name:lower()
+			if lower and lower:find(s.lower, 1, true) then
 				matches[#matches + 1] = { id = id, name = name, qty = res.totalQuantity, price = res.minPrice, starts = lower:sub(1, #s.lower) == s.lower }
 				if lower == s.lower then exact = id end
 			end
@@ -1082,12 +1509,15 @@ function HS.FinishNameSearch(s)
 		return
 	end
 	local title
-	if #matches == 0 then
+	if #matches == 0 and loading > 0 then
+		title = "Still loading names. Press Enter again."
+	elseif #matches == 0 then
 		title = "Nothing for sale called that right now"
 	else
 		title = "Click one, or use Up/Down and Enter"
 	end
 	ShowSuggestions(s.box, s.onPick, title, matches)
+	ui.picker.fromAH = true -- these came from the auction house: keep them until you type again
 end
 
 -- Hooks an item box up to the search bar behavior.
@@ -1774,12 +2204,16 @@ The status line and the big BUY button at the bottom are the same on every tab.]
 
 The Focus tab and the Shopping List both have a box for adding items. You can:
 
-- ]] .. H .. [[Type the name.|r After 3 letters, matching items for sale drop down, with how many are listed and the cheapest price. Click one, or use the Up/Down keys and Enter. Escape closes the list.
+- ]] .. H .. [[Type the name.|r After 2 letters, matching items drop down straight away, like a search bar. Click one, or use the Up/Down keys and Enter. Escape closes the list.
 - ]] .. H .. [[Drop it|r from your bags on the "Drop item here" button.
 - ]] .. H .. [[Shift-click it|r (in your bags or a chat link) while the box is selected.
 - ]] .. H .. [[Type its ID number|r and press Enter.
 
-Only items sold by quantity work: cloth, herbs, ore, dye and so on. Gear and bags can't be bought this way, so the search leaves them out.]] },
+Only items sold by quantity work: cloth, herbs, ore, dye and so on. Gear and bags can't be bought this way, so the search leaves them out.
+
+]] .. H .. [[Where the names come from:|r the addon keeps its own saved list of every item sold by quantity on the auction house. When you open the auction house, and every 15 minutes while it's open, it copies the whole auction house in one go (the game allows one copy every 15 minutes). The copy isn't a search, so nothing changes in the auction house window. If an item isn't in the list yet (say it was just listed), type its name and press Enter: it searches the auction house for it and remembers it.
+
+The list also shows how many are listed and the cheapest price from the last copy. Hover a name to see its normal price.]] },
 
 	{ title = "Focus", text = H .. [[Focus|r
 
@@ -1805,7 +2239,7 @@ Shopping lists are for filling a list of materials at good prices, without racin
 - ]] .. H .. [[Edit strip:|r click an item to switch between % of normal and a fixed price, change its amount, or remove it.
 - ]] .. H .. [[Rest of list:|r roughly what the rest of the list would cost at today's prices. It turns red when that's more than you can spend.
 
-Normal prices take about 10 minutes of watching to learn. Until then, a % item shows "learning" and won't buy. Fixed-price items work straight away.]] },
+]] .. H .. [[Normal price:|r what an item usually sells for. It comes from the auction house copies (see Adding items): each copy looks at the cheaper listings, ignoring a few silly ones, and the last 14 days are combined with recent days counting most. Items get a normal price a few seconds after you first open the auction house. An item nobody had listed in a copy shows "learning" and won't buy until it's been watched for a while. Fixed-price items work straight away.]] },
 
 	{ title = "Buying", text = H .. [[Buying|r
 
@@ -1846,10 +2280,11 @@ There are no pop-ups to click through. These rules protect you instead:
 
 	{ title = "Tips and limits", text = H .. [[Tips and limits|r
 
-- The game allows about 100 auction searches a minute across all addons. Running TSM's Sniper at the same time slows both down.
+- The game allows about 100 auction searches a minute, shared by everything you run. If another addon or app is scanning the auction house at the same time, both slow down.
 - The auction house handles one purchase at a time, so items are bought one after another, not all at once.
 - On a shopping list, ticked items take turns. With 4 items, each is checked about every 2.4 seconds. Finished items are skipped, so the rest speed up.
-- Normal prices come from what the addon has seen over the last 3 days.
+- Normal prices come from the auction house copies over the last 14 days, recent days counting most.
+- Hover any item (in your bags, a chat link or the search list) to see its normal price and the cheapest price from the last copy.
 - Typing a name searches the auction house, so the auction house window shows those results too. That's harmless.
 - Type /hsnipe in chat for a few text commands.]] },
 }
@@ -2309,6 +2744,12 @@ local function InitDB()
 	db.items = db.items or {}
 	db.prices = db.prices or {}
 	db.history = db.history or {}
+	db.names = db.names or {}
+	db.notSold = db.notSold or {}
+	db.market = db.market or {}
+	for id, m in pairs(db.market) do
+		if not m.at or time() - m.at > 15 * 86400 then db.market[id] = nil end -- gone from the AH
+	end
 	if (db.version or 1) < 2 then
 		-- upgrade from v0.1: keep the watch list, add the new settings
 		db.interval = MIN_INTERVAL
@@ -2392,6 +2833,10 @@ ev:RegisterEvent("ADDON_ACTION_FORBIDDEN")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_SYSTEM_READY") -- not on every client; Tick checks too
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED") -- typed item names
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_FAILURE")
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_RESULTS_ADDED") -- more results of your own searches
+pcall(ev.RegisterEvent, ev, "REPLICATE_ITEM_LIST_UPDATE") -- the full auction house copy arrived
+ev:RegisterEvent("GET_ITEM_INFO_RECEIVED") -- an item's details finished loading
+pcall(ev.RegisterEvent, ev, "ITEM_KEY_ITEM_INFO_RECEIVED") -- an item name finished loading
 ev:SetScript("OnEvent", function(_, event, ...)
 	if event == "ADDON_LOADED" then
 		if ... == ADDON_NAME then
@@ -2412,13 +2857,32 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		HS.ShowTab(db.tab or "focus")
 		SetStatus(scanning and "Scanning..." or "Paused. Click Start.", 0.8, 0.8, 0.8)
 		if not db.seenWelcome then HS.ShowWelcome() end
+		SeedNames()
+		HS.StartFullScan()
 
 	elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+		LearnBrowse(C_AuctionHouse.GetBrowseResults()) -- every search teaches it names, yours too
 		if nameSearch and nameSearch.sent and not nameSearch.waiting then
 			local s = nameSearch
 			s.waiting = true
 			C_Timer.After(0.3, function() HS.FinishNameSearch(s) end) -- gives item names a moment to load
 		end
+
+	elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_ADDED" then
+		local added = ...
+		LearnBrowse(type(added) == "table" and added or C_AuctionHouse.GetBrowseResults())
+
+	elseif event == "REPLICATE_ITEM_LIST_UPDATE" then
+		HS.FullScanArrived()
+
+	elseif event == "GET_ITEM_INFO_RECEIVED" then
+		local id = ...
+		if id then HS.ItemLoaded(id) end
+
+	elseif event == "ITEM_KEY_ITEM_INFO_RECEIVED" then
+		local id = ...
+		local key = id and keyWaiting[id]
+		if key then LearnKey(key) end
 
 	elseif event == "AUCTION_HOUSE_BROWSE_FAILURE" then
 		if nameSearch and nameSearch.sent then
@@ -2431,6 +2895,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
 	elseif event == "AUCTION_HOUSE_CLOSED" then
 		HS.ClosePicker()
+		full = nil -- not finished: it tries again next time
 		if ui.listMenu then ui.listMenu:Hide() end
 		if pending and pending.stage ~= "buying" then CancelQuote() end
 		ahOpen = false
