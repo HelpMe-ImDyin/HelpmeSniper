@@ -1,4 +1,4 @@
--- Helpme Sniper v0.6.1
+-- Helpme Sniper v0.6.2
 -- Personal quick-buy sniper for stackable auction house items (cloth, dye, herbs).
 -- Standalone: scans the auction house itself, no other addons needed.
 --
@@ -70,6 +70,7 @@ local pending -- { itemID, qty, expected, quote, stage = quoting|ready|waitline|
 local selected, editID
 local dealMsgID -- the item whose "Deal:" message is on the status line, so it can be cleared
 local typingMax -- the Focus max price while it's being typed (for the live typo warning)
+local nameSearch -- an item name you typed that's being looked up on the auction house
 local ui = {}
 
 -- ============================================================================
@@ -451,6 +452,19 @@ local function Tick()
 	if not db or not ahOpen then return end
 	local now = GetTime()
 	if HS.UpdateAge then HS.UpdateAge(now) end
+	-- Typed item names: search once the typing pause is over and the line is free
+	-- (never in the middle of a purchase).
+	if nameSearch and not pending then
+		if not nameSearch.sent then
+			if now >= nameSearch.due and LineReady() then HS.SendNameSearch() end
+		elseif not nameSearch.waiting and now - nameSearch.sent > 5 then
+			local s = nameSearch
+			nameSearch = nil
+			if ui.picker and ui.picker:IsShown() and ui.picker.box == s.box then
+				ui.picker.title:SetText("No answer from the auction house. Keep typing or press Enter.")
+			end
+		end
+	end
 	if pending then
 		if pending.stage == "waitline" and LineReady() then
 			SendConfirm(true) -- the line just freed up: buy now
@@ -679,6 +693,225 @@ local function MoneyBoxes(parent, x, y, onCommit, onChange)
 end
 
 -- ============================================================================
+-- Find an item by typing its name, like a search bar: after 3 letters a list of matching
+-- items for sale drops down and updates as you type. Click one, or use Up/Down + Enter.
+-- ============================================================================
+
+local SUGGEST_ROWS = 8
+
+local function Picker()
+	if ui.picker then return ui.picker end
+	local pk = CreateFrame("Frame", nil, ui.frame, "BackdropTemplate")
+	pk:SetFrameStrata("DIALOG")
+	pk:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
+	pk:SetBackdropColor(0.08, 0.09, 0.1, 0.98)
+	pk:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	pk:SetWidth(290)
+	pk.title = Text(pk, "GameFontDisableSmall", 6, -6, 250)
+	Button(pk, "X", 266, -3, 20, 18, function() HS.ClosePicker() end)
+	pk.rows = {}
+	for i = 1, SUGGEST_ROWS do
+		local b = CreateFrame("Button", nil, pk)
+		b:SetSize(282, 18)
+		b:SetPoint("TOPLEFT", 4, -22 - (i - 1) * 18)
+		local hl = b:CreateTexture(nil, "HIGHLIGHT") -- mouse over
+		hl:SetAllPoints()
+		hl:SetColorTexture(0.3, 0.5, 0.8, 0.35)
+		b.sel = b:CreateTexture(nil, "BACKGROUND") -- chosen with the arrow keys
+		b.sel:SetAllPoints()
+		b.sel:SetColorTexture(0.3, 0.5, 0.8, 0.35)
+		b.sel:Hide()
+		b.icon = b:CreateTexture(nil, "ARTWORK")
+		b.icon:SetSize(16, 16)
+		b.icon:SetPoint("LEFT", 2, 0)
+		b.name = Text(b, "GameFontHighlightSmall", 22, -3, 150)
+		b.qty = Text(b, "GameFontDisableSmall", 172, -3, 44, "RIGHT")
+		b.price = Text(b, "GameFontHighlightSmall", 218, -3, 62, "RIGHT")
+		b:SetScript("OnClick", function(self)
+			if self.itemID then HS.PickSuggestion(self.itemID) end
+		end)
+		pk.rows[i] = b
+	end
+	pk:Hide()
+	ui.picker = pk
+	return pk
+end
+
+function HS.ClosePicker()
+	nameSearch = nil
+	if ui.picker then ui.picker:Hide() end
+end
+
+-- Highlights suggestion number i (for the arrow keys).
+local function SelectSuggestion(i)
+	local pk = ui.picker
+	if not pk then return end
+	local n = pk.count or 0
+	if n == 0 then
+		pk.selected = nil
+	else
+		pk.selected = ((i - 1) % n) + 1
+	end
+	for j, b in ipairs(pk.rows) do b.sel:SetShown(j == pk.selected) end
+end
+
+-- Opens or updates the list under the box. matches = nil keeps the rows already shown.
+local function ShowSuggestions(box, onPick, title, matches)
+	local pk = Picker()
+	if pk.box ~= box then matches = matches or {} end -- switched to the other box: start clean
+	pk.box, pk.onPick = box, onPick
+	pk.title:SetText(title or "")
+	if matches then
+		local n = math.min(#matches, SUGGEST_ROWS)
+		for i, b in ipairs(pk.rows) do
+			local m = matches[i]
+			b.itemID = m and m.id
+			if m then
+				local icon = (C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(m.id)) or (GetItemIcon and GetItemIcon(m.id))
+				b.icon:SetTexture(icon or 134400)
+				b.name:SetText(m.name)
+				b.qty:SetText(m.qty and m.qty > 0 and tostring(m.qty) or "")
+				b.price:SetText(m.price and Money(m.price) or "")
+			end
+			b:SetShown(i <= n)
+		end
+		pk.count = n
+		SelectSuggestion(1)
+	end
+	pk:SetHeight(26 + (pk.count or 0) * 18)
+	pk:ClearAllPoints()
+	pk:SetPoint("TOP", box, "BOTTOM", 0, -2)
+	pk:SetPoint("RIGHT", ui.frame, "RIGHT", -8, 0)
+	pk:Show()
+end
+
+function HS.PickSuggestion(id)
+	local pk = ui.picker
+	local box, onPick = pk and pk.box, pk and pk.onPick
+	if box then
+		box:SetText("")
+		box:ClearFocus()
+	end
+	HS.ClosePicker()
+	if onPick and id then onPick(id) end
+end
+
+-- Runs on every letter typed into an item box.
+function HS.NameTyped(box, onPick)
+	local q = (box:GetText() or ""):match("^%s*(.-)%s*$")
+	if #q < 3 or q:find("item:") or q:match("^%d+$") then
+		HS.ClosePicker()
+		return
+	end
+	if not ahOpen then return end
+	-- Wait for a short pause in typing, then search (so it isn't one search per letter).
+	nameSearch = { text = q, lower = q:lower(), box = box, onPick = onPick, due = GetTime() + 0.35 }
+	ShowSuggestions(box, onPick, "Searching...", nil)
+end
+
+-- Enter in an item box: an ID or link is used straight away; otherwise the highlighted
+-- suggestion; with no list yet, it searches now and takes a clear match.
+function HS.NameEnter(box, onPick)
+	local text = box:GetText()
+	local id = ItemIDFromText(text)
+	local pk = ui.picker
+	if not id and pk and pk:IsShown() and pk.box == box and not nameSearch and pk.selected then
+		id = pk.rows[pk.selected].itemID
+	end
+	if id then
+		box:SetText("")
+		box:ClearFocus()
+		HS.ClosePicker()
+		onPick(id)
+		return
+	end
+	HS.NameTyped(box, onPick)
+	if nameSearch then
+		nameSearch.due = 0
+		nameSearch.enter = true
+	end
+end
+
+-- Up/Down arrows move through the suggestions.
+function HS.NameArrow(box, key)
+	local pk = ui.picker
+	if not (pk and pk:IsShown() and pk.box == box and (pk.count or 0) > 0) then return end
+	if key == "DOWN" then
+		SelectSuggestion((pk.selected or 0) + 1)
+	elseif key == "UP" then
+		SelectSuggestion((pk.selected or 2) - 1)
+	end
+end
+
+-- Sends the search (Tick calls this once the pause is over and the auction house line is free).
+function HS.SendNameSearch()
+	local s = nameSearch
+	if not s or s.sent then return end
+	local sorts = {}
+	if Enum and Enum.AuctionHouseSortOrder then
+		sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Name, reverseSort = false } }
+	end
+	local now = GetTime()
+	s.sent = now
+	lastSend = now -- the regular searching waits its turn
+	sendTimes[#sendTimes + 1] = now
+	C_AuctionHouse.SendBrowseQuery({ searchString = s.text, sorts = sorts, filters = {}, itemClassFilters = {} })
+end
+
+-- Reads the results into the list.
+function HS.FinishNameSearch(s)
+	if nameSearch ~= s then return end -- you kept typing: a newer search replaces this one
+	nameSearch = nil
+	local seen, matches, exact = {}, {}, nil
+	for _, res in ipairs(C_AuctionHouse.GetBrowseResults() or {}) do
+		local id = res.itemKey and res.itemKey.itemID
+		if id and not seen[id] then
+			seen[id] = true
+			local info = C_AuctionHouse.GetItemKeyInfo and C_AuctionHouse.GetItemKeyInfo(res.itemKey)
+			local name = (info and info.itemName) or ItemName(id)
+			local lower = name:lower()
+			-- Gear and bags can't be bought by quantity, so leave them out.
+			local status = C_AuctionHouse.GetItemCommodityStatus and C_AuctionHouse.GetItemCommodityStatus(id)
+			local gear = Enum and Enum.ItemCommodityStatus and status == Enum.ItemCommodityStatus.Item
+			if not gear and lower:find(s.lower, 1, true) then
+				matches[#matches + 1] = { id = id, name = name, qty = res.totalQuantity, price = res.minPrice, starts = lower:sub(1, #s.lower) == s.lower }
+				if lower == s.lower then exact = id end
+			end
+		end
+	end
+	table.sort(matches, function(a, b)
+		if a.starts ~= b.starts then return a.starts end
+		return #a.name < #b.name
+	end)
+	if s.enter and (exact or #matches == 1) then
+		HS.PickSuggestion(exact or matches[1].id)
+		return
+	end
+	local title
+	if #matches == 0 then
+		title = "Nothing for sale called that right now"
+	else
+		title = "Click one, or use Up/Down and Enter"
+	end
+	ShowSuggestions(s.box, s.onPick, title, matches)
+end
+
+-- Hooks an item box up to the search bar behavior.
+local function MakeSearchBox(box, onPick)
+	if box.SetAltArrowKeyMode then box:SetAltArrowKeyMode(false) end -- plain arrow keys reach the box
+	box:SetScript("OnTextChanged", function(self, userInput)
+		if userInput then HS.NameTyped(self, onPick) end
+	end)
+	box:SetScript("OnEnterPressed", function(self) HS.NameEnter(self, onPick) end)
+	box:SetScript("OnArrowPressed", function(self, key) HS.NameArrow(self, key) end)
+	box:SetScript("OnEscapePressed", function(self)
+		self:SetText("")
+		self:ClearFocus()
+		HS.ClosePicker()
+	end)
+end
+
+-- ============================================================================
 -- Window
 -- ============================================================================
 
@@ -693,6 +926,7 @@ function HS.ShowTab(key)
 		db.mode = "all"
 	end
 	HS.UpdateMode()
+	HS.ClosePicker() -- the search list belongs to the tab you were on
 	if dealMsgID and Target() ~= dealMsgID then SetStatus("") end -- switching tabs: drop a deal message that no longer applies
 	for _, t in ipairs(TABS) do
 		ui.panels[t.key]:SetShown(t.key == key)
@@ -726,13 +960,7 @@ local function BuildWatchPanel(p)
 	ui.addHint:SetText("or shift-click / name / ID")
 	ui.addBox:SetScript("OnEditFocusGained", function() ui.addHint:Hide() end)
 	ui.addBox:SetScript("OnEditFocusLost", function(self) ui.addHint:SetShown(self:GetText() == "") end)
-	ui.addBox:SetScript("OnEscapePressed", function(self) self:SetText("") self:ClearFocus() end)
-	ui.addBox:SetScript("OnEnterPressed", function(self)
-		local id = ItemIDFromText(self:GetText())
-		self:SetText("")
-		self:ClearFocus()
-		if id then HS.AddItem(id) else Print("Couldn't read an item from that. Shift-click an item or type its ID.") end
-	end)
+	MakeSearchBox(ui.addBox, HS.AddItem)
 	ui.addBox:SetScript("OnReceiveDrag", AddFromCursor)
 	ui.watchLive = Text(p, "GameFontHighlightSmall", 350, -8, 104, "RIGHT")
 
@@ -921,17 +1149,7 @@ local function BuildFocusPanel(p)
 	hint:SetText("or shift-click / name / ID")
 	ui.focusBox:SetScript("OnEditFocusGained", function() hint:Hide() end)
 	ui.focusBox:SetScript("OnEditFocusLost", function(self) hint:SetShown(self:GetText() == "") end)
-	ui.focusBox:SetScript("OnEscapePressed", function(self) self:SetText("") self:ClearFocus() end)
-	ui.focusBox:SetScript("OnEnterPressed", function(self)
-		local id = ItemIDFromText(self:GetText())
-		self:SetText("")
-		self:ClearFocus()
-		if id then
-			HS.SetFocusItem(id)
-		else
-			Print("Couldn't find that item by name (names only work for items your game has loaded). Drop it or shift-click it instead.")
-		end
-	end)
+	MakeSearchBox(ui.focusBox, HS.SetFocusItem)
 	ui.focusBox:SetScript("OnReceiveDrag", AddFromCursor)
 
 	ui.fEmpty = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -1387,6 +1605,7 @@ local function OnInsertLink(link)
 	if ui.focusBox and ui.focusBox:HasFocus() and link then
 		ui.focusBox:SetText("")
 		ui.focusBox:ClearFocus()
+		HS.ClosePicker()
 		HS.SetFocusItem(ItemIDFromText(link))
 		return
 	end
@@ -1394,6 +1613,7 @@ local function OnInsertLink(link)
 		local id = ItemIDFromText(link)
 		ui.addBox:SetText("")
 		ui.addBox:ClearFocus()
+		HS.ClosePicker()
 		if id then HS.AddItem(id) end
 	end
 end
@@ -1468,6 +1688,8 @@ ev:RegisterEvent("PLAYER_MONEY")
 ev:RegisterEvent("ADDON_ACTION_BLOCKED")
 ev:RegisterEvent("ADDON_ACTION_FORBIDDEN")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_SYSTEM_READY") -- not on every client; Tick checks too
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED") -- typed item names
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_FAILURE")
 ev:SetScript("OnEvent", function(_, event, ...)
 	if event == "ADDON_LOADED" then
 		if ... == ADDON_NAME then
@@ -1488,7 +1710,24 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		HS.ShowTab(db.tab or "focus")
 		SetStatus(scanning and "Scanning..." or "Paused. Click Start.", 0.8, 0.8, 0.8)
 
+	elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+		if nameSearch and nameSearch.sent and not nameSearch.waiting then
+			local s = nameSearch
+			s.waiting = true
+			C_Timer.After(0.3, function() HS.FinishNameSearch(s) end) -- gives item names a moment to load
+		end
+
+	elseif event == "AUCTION_HOUSE_BROWSE_FAILURE" then
+		if nameSearch and nameSearch.sent then
+			local s = nameSearch
+			nameSearch = nil
+			if ui.picker and ui.picker:IsShown() and ui.picker.box == s.box then
+				ui.picker.title:SetText("The search didn't work. Keep typing or press Enter.")
+			end
+		end
+
 	elseif event == "AUCTION_HOUSE_CLOSED" then
+		HS.ClosePicker()
 		if pending and pending.stage ~= "buying" then CancelQuote() end
 		ahOpen = false
 		scanning = false

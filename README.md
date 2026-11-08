@@ -30,6 +30,8 @@ The window opens when you open the auction house.
 
 Shift-click the - and + buttons to change the amount by 10.
 
+**Adding items:** drop an item on "Drop item here", shift-click it into the box, or just start typing its name. After 3 letters, matching items for sale drop down (with how many are listed and the cheapest price), like a search bar. Click one, or use the Up/Down keys and Enter.
+
 **Safety, without pop-ups:**
 - Your max price per item: it never pays more on average.
 - Typo guard: if your max is more than double the usual price (say 20g instead of 20c), it warns you as you type and won't buy until you click "I meant it".
