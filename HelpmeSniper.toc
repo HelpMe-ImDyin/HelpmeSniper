@@ -1,0 +1,8 @@
+## Interface: 120105, 50504, 20506, 16001, 11509
+## Title: Helpme Sniper
+## Notes: Fast buying for auction house materials (cloth, dye, herbs): set a max price and quantity, then buy deals with one key.
+## Author: HelpMe ImDyin
+## Version: 0.3
+## SavedVariables: HelpmeSniperDB
+
+HelpmeSniper.lua

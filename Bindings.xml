@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="HELPMESNIPER_BUY" header="HELPMESNIPER" category="ADDONS">
+		HelpmeSniper_BuyStep()
+	</Binding>
+</Bindings>

@@ -1,0 +1,31 @@
+# Builds the addon zip and publishes a GitHub release whenever a version tag (like v0.4) is pushed.
+# WowUp finds the zip because its name ends in "-forever".
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package the addon
+        run: |
+          mkdir -p build/HelpmeSniper
+          cp HelpmeSniper.toc HelpmeSniper.lua Bindings.xml build/HelpmeSniper/
+          cd build
+          zip -r "HelpmeSniper-${GITHUB_REF_NAME}-forever.zip" HelpmeSniper
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "build/HelpmeSniper-${GITHUB_REF_NAME}-forever.zip" \
+            --title "Helpme Sniper $GITHUB_REF_NAME" --generate-notes
