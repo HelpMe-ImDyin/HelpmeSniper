@@ -39,7 +39,7 @@ For racing for a deal. Only that item is searched, every 0.6 seconds.
 ### Shopping Lists: fill a list at good prices
 
 For filling a list of materials at good prices, without racing.
-- **Several lists** ("Tailoring 75–150", "Dyes"...). Click the list name to switch lists, see completed ones, or rename, copy or delete. Only the open list is searched, which keeps it fast.
+- **Several lists** ("Tailoring 75–150", "Dyes"...). Click the list name to switch lists, see completed ones, or rename, copy or delete. Only the open list is searched: its items take turns, one search every 0.6 seconds, so with 10 items each is checked about every 6 seconds. BUY always checks the exact live price before paying.
 - **Deals at X% of normal:** an item is a deal when it's at or under that share of its normal price (80% by default). Click an item to give it its own % or a fixed price.
 - **Columns:** On, Deal at, Normal (its usual price), Now (cheapest price and how far from normal, YES when it's a deal), Got.
 - **Track totals** (tick box): counts what you buy ("40/180") and never buys past each amount. It remembers until you mark the list complete, even after logging off. Untick it to just buy freely.
@@ -73,6 +73,8 @@ Shift-click the - and + buttons to change an amount by 10.
 - The game needs a real click or key press to start each purchase, so the addon never buys without you clicking. If the game ever refuses the automatic last step, the addon switches to "click again to buy" by itself.
 - The auction house handles one purchase at a time, so items are bought one after another.
 - WoW allows about 100 auction searches per minute, shared by everything you run. If another addon or app is scanning the auction house at the same time, both slow down.
+- Selling: the auction house handles one request at a time and greys out its Create Auction button while one is waiting. So while you're selling, the shopping list pauses by itself (the marker says "Paused: selling") and carries on about 30 seconds after you post. If anything else is using the auction house (its own window, another addon), it waits about 10 seconds ("Waiting: AH busy"). Focus never pauses, because it's for racing.
+- Mouse on the auction house: while your mouse is over the auction house window, searching eases off to one search every 2 seconds, so its buttons (like Create Auction) stay usable. The marker says "easy: mouse on AH". With your mouse on Helpme Sniper (or anywhere else) it runs at full speed. To post with nothing searching at all, click Stop.
 - Only works for items sold by quantity, not gear or bags.
 - Updating from an older version: your Watch List becomes a shopping list called "My list", with the same items, prices and amounts.
 

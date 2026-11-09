@@ -2,7 +2,7 @@
 ## Title: Helpme Sniper
 ## Notes: Fast buying for auction house materials (cloth, dye, herbs): set a max price and quantity, then buy deals with one key.
 ## Author: HelpMe ImDyin
-## Version: 0.7.1
+## Version: 0.7.2
 ## SavedVariables: HelpmeSniperDB
 
 HelpmeSniper.lua

@@ -61,6 +61,17 @@ local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 6, 20, 8
 -- While a deal is on screen, search less often so the auction house line is free the
 -- instant you press buy (a search in flight can delay or swallow the price request).
 local DEAL_INTERVAL = 2.0
+-- Mouse over the auction house window (you're doing something there, like selling): search
+-- only this often, so its own buttons (like Create Auction) stay usable. Anywhere else,
+-- including over our window, searching runs at full speed.
+local HOVER_INTERVAL = 2.0
+-- After every answer, wait until the line has been free this long before asking again, so
+-- the auction house's own buttons (like Create Auction) and other addons always get a turn.
+local LINE_GAP = 0.3
+-- Selling: searching pauses while you put something up for sale, and this long after.
+local SELL_PAUSE = 30
+-- Someone else (the auction house window, another addon) is using the line: wait this long.
+local OTHERS_PAUSE = 10
 
 local db
 local ahOpen, scanning = false, false
@@ -78,6 +89,12 @@ local full -- the full auction house copy in progress (see "Full scan")
 local namesDirty, namesRefreshAt = false, 0 -- new names learned: refresh the open list
 local keyWaiting = {} -- [itemID] = auction house item whose name the game is still loading
 local ui = {}
+local sellUntil, othersUntil = 0, 0 -- searching pauses until these times (you're selling / the line is in use)
+local lineFreeSince -- when the auction house line last became free (nil while it's busy)
+local checkSoon = {} -- shopping list items the last full copy says may be a deal: check live first
+local function ClearCheckSoon()
+	for k in pairs(checkSoon) do checkSoon[k] = nil end
+end
 
 -- ============================================================================
 -- Helpers
@@ -532,6 +549,7 @@ local function SendConfirm(auto)
 	pending.auto = auto
 	pending.t = GetTime()
 	SetStatus(("Buying %d %s for %s..."):format(pending.qty, ItemName(pending.itemID), Money(pending.quote)), 1, 1, 0)
+	lineFreeSince = nil
 	C_AuctionHouse.ConfirmCommoditiesPurchase(pending.itemID, pending.qty)
 end
 
@@ -569,6 +587,7 @@ function HelpmeSniper_BuyStep()
 		itemID = id, qty = r.avail, expected = r.total, max = r.max, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now(),
 		cfg = cfg, list = (cfg and cfg.kind == "list") and ActiveList() or nil, -- where to count the purchase
 	}
+	lineFreeSince = nil
 	C_AuctionHouse.StartCommoditiesPurchase(id, r.avail)
 	SetStatus(("Getting price for %d %s..."):format(r.avail, ItemName(id)), 1, 1, 0)
 	HS.Refresh()
@@ -578,15 +597,72 @@ end
 -- Scanning
 -- ============================================================================
 
+-- ----------------------------------------------------------------------------
+-- Selling: the auction house handles one request at a time, and greys out its own
+-- Create Auction button while any request is waiting. So while you're selling, the addon
+-- stays off the line. It notices selling from the game's own steps (working out the
+-- deposit, posting), which works however the auction house window looks.
+-- ----------------------------------------------------------------------------
+
+local function NoteSelling()
+	sellUntil = GetTime() + SELL_PAUSE
+end
+
+local function SellFrameShown()
+	local f = _G.AuctionHouseFrame
+	if not f then return false end
+	for _, key in ipairs({ "ItemSellFrame", "CommoditiesSellFrame" }) do
+		local s = f[key]
+		if s and s.IsVisible and s:IsVisible() then return true end
+	end
+	return false
+end
+
+-- Why searching is paused right now: "selling", "busy" (someone else is using the line), or nil.
+local function PauseReason(now)
+	if now < sellUntil or SellFrameShown() then return "selling" end
+	if now < othersUntil then return "busy" end
+	return nil
+end
+
+do
+	local function hookIf(tbl, name)
+		if tbl and type(tbl[name]) == "function" then pcall(hooksecurefunc, tbl, name, NoteSelling) end
+	end
+	for _, name in ipairs({ "CalculateItemDeposit", "CalculateCommodityDeposit", "PostItem", "PostCommodity" }) do
+		hookIf(C_AuctionHouse, name)
+	end
+	-- older-style auction house functions, in case this client's selling page uses them
+	for _, name in ipairs({ "CalculateAuctionDeposit", "GetAuctionDeposit", "PostAuction", "StartAuction", "ClickAuctionSellItemButton" }) do
+		hookIf(_G, name)
+	end
+end
+
+-- True once the line has been free for LINE_GAP seconds (Tick keeps lineFreeSince up to date).
+local function LineFree(now)
+	return lineFreeSince ~= nil and now - lineFreeSince >= LINE_GAP
+end
+
+
+-- True while the mouse is over the auction house window and not over ours (or our name list).
+local function MouseOnAH()
+	local ah = _G.AuctionHouseFrame or _G.AuctionFrame
+	if not (ah and ah:IsVisible() and ah:IsMouseOver()) then return false end
+	if ui.frame and ui.frame:IsVisible() and ui.frame:IsMouseOver() then return false end
+	if ui.picker and ui.picker:IsVisible() and ui.picker:IsMouseOver() then return false end
+	if ui.guide and ui.guide:IsVisible() and ui.guide:IsMouseOver() then return false end
+	return true
+end
+
 local function CanSend(now)
 	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
 	if #sendTimes >= MAX_PER_WINDOW then return false end
 	local interval = db.interval or MIN_INTERVAL
+	if not priorityID and ui.mouseOnAH then interval = math.max(interval, HOVER_INTERVAL) end -- leave the auction house room
 	if not priorityID and Target() then interval = math.max(interval, DEAL_INTERVAL) end -- keep the line free for your press
 	if now - lastSend < interval then return false end
 	if awaiting and now - awaiting.t < 3 then return false end -- wait for the last answer (max 3s)
-	if C_AuctionHouse.IsThrottledMessageSystemReady and not C_AuctionHouse.IsThrottledMessageSystemReady() then return false end
-	return true
+	return LineFree(now)
 end
 
 local function NextItem()
@@ -596,6 +672,10 @@ local function NextItem()
 		if Cfg(id) then return id end
 	end
 	if not scanning then return nil end
+	while checkSoon[1] do
+		local id = table.remove(checkSoon, 1)
+		if Cfg(id) and db.mode ~= "focus" then return id end
+	end
 	if db.mode == "focus" then
 		return (focusID and db.items[focusID]) and focusID or nil
 	end
@@ -617,6 +697,30 @@ end
 local function Tick()
 	if not db or not ahOpen then return end
 	local now = GetTime()
+	if LineReady() then
+		lineFreeSince = lineFreeSince or now
+	else
+		lineFreeSince = nil
+		-- The line is busy but not with anything of ours: the auction house window or another
+		-- addon (say, posting through another addon) is using it. Step aside for a while.
+		local ours = pending or (awaiting and now - awaiting.t < 3) or (full and full.stage == "wait")
+			or (nameSearch and nameSearch.sent) or now - lastSend < 1.5
+		if not ours then othersUntil = now + OTHERS_PAUSE end
+	end
+	-- Focus never pauses: it's for racing, and a paused Focus would look broken. Only the
+	-- shopping list (and the 15-minute copy) step aside while you sell or the line is in use.
+	local rawPause = PauseReason(now)
+	local pause = db.mode ~= "focus" and rawPause or nil
+	-- Selling while Focus races: say once (per auction house visit) why posting may flicker.
+	if rawPause == "selling" and db.mode == "focus" and scanning and not ui.focusSellTip and not pending and not dealMsgID then
+		ui.focusSellTip = true
+		SetStatus("Focus is racing, so Create Auction may flicker. Click Stop to post freely.", 1, 0.82, 0)
+	end
+	local onAH = MouseOnAH()
+	if pause ~= ui.pauseShown or onAH ~= ui.mouseOnAH then
+		ui.pauseShown, ui.mouseOnAH = pause, onAH
+		HS.Refresh() -- the Live marker says why it's paused or easing off
+	end
 	if HS.UpdateAge then HS.UpdateAge(now) end
 	if namesDirty and now - namesRefreshAt > 0.5 then
 		namesRefreshAt = now
@@ -626,7 +730,7 @@ local function Tick()
 	-- the line is free (never in the middle of a purchase).
 	if nameSearch and not pending then
 		if not nameSearch.sent then
-			if now >= nameSearch.due and LineReady() and (not Target() or now - (nameSearch.made or 0) > 3) then HS.SendNameSearch() end
+			if now >= nameSearch.due and not rawPause and LineFree(now) and (not Target() or now - (nameSearch.made or 0) > 3) then HS.SendNameSearch() end
 		elseif not nameSearch.waiting and now - nameSearch.sent > 5 then
 			local s = nameSearch
 			nameSearch = nil
@@ -650,13 +754,15 @@ local function Tick()
 		end
 		return -- no searching while a purchase is in progress
 	end
-	if not full then HS.StartFullScan() end
-	if full and HS.FullScanStep(now) then return end
+	if not full and not rawPause then HS.StartFullScan() end
+	if full and HS.FullScanStep(now, rawPause) then return end
+	if pause then return end -- shopping list: you're selling, or someone else is using the line
 	if not scanning and not priorityID then return end
 	if not CanSend(now) then return end
 	local id = NextItem()
 	if not id then return end
 	lastSend = now
+	lineFreeSince = nil
 	sendTimes[#sendTimes + 1] = now
 	awaiting = { id = id, t = now }
 	C_AuctionHouse.SendSearchQuery(C_AuctionHouse.MakeItemKey(id), {}, true)
@@ -674,6 +780,7 @@ end
 function HS.OpenList(i)
 	if not db.lists[i] then return end
 	db.activeList = i
+	ClearCheckSoon()
 	results = {}
 	selected, editID = nil, nil
 	nextIndex = 1
@@ -946,7 +1053,14 @@ end
 
 -- The small "Live" / "Paused" marker: a colored square plus a word.
 local function LiveText()
-	if scanning then
+	if ui.pauseShown == "selling" then
+		return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:255:209:0|t |cffffd100Paused: selling|r"
+	elseif ui.pauseShown == "busy" then
+		return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:255:209:0|t |cffffd100Waiting: AH busy|r"
+	end
+	if scanning and ui.mouseOnAH then
+		return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:51:255:51|t |cff33ff33Live|r |cffaaaaaa(easy: mouse on AH)|r"
+	elseif scanning then
 		return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:51:255:51|t |cff33ff33Live|r"
 	end
 	return "|TInterface\\Buttons\\WHITE8X8:8:8:0:0:8:8:0:8:0:8:255:136:51|t |cffff8833Paused - click Start|r"
@@ -1130,7 +1244,23 @@ end
 
 local function FinishScan()
 	local count = full.count or 0
+	local since = full.arrivedAt or 0
 	full = nil
+	if scanning and db.mode ~= "focus" then
+		local L = ActiveList()
+		for _, id in ipairs(L and not L.done and L.order or {}) do
+			local cfg, m = L.items[id], db.market[id]
+			local max = cfg and MaxFor(cfg, id)
+			local queued = false
+			for _, q in ipairs(checkSoon) do
+				if q == id then queued = true end
+			end
+			if not queued and cfg and cfg.enabled ~= false and not ItemDone(L, cfg) and m and m.min and m.at
+				and m.at >= since and max and m.min <= max then
+				checkSoon[#checkSoon + 1] = id
+			end
+		end
+	end
 	db.scanAt = time()
 	namesDirty = true
 	if not pending and not dealMsgID then
@@ -1152,18 +1282,20 @@ function HS.FullScanArrived()
 		return
 	end
 	full.stage, full.i, full.n, full.auctions = "read", 0, n, {}
+	full.arrivedAt = time()
 end
 
 -- Called by Tick. Returns true when it used the auction house line this time.
-function HS.FullScanStep(now)
+function HS.FullScanStep(now, selling)
 	if full.stage == "ask" then
-		if now < full.t or not LineReady() or Target() then return false end
+		if selling or now < full.t or not LineFree(now) or Target() then return false end
 		if not pcall(C_AuctionHouse.ReplicateItems) then
 			FailScan(true)
 			return false
 		end
 		db.scanAskedAt = time()
 		full.stage, full.t = "wait", now
+		lineFreeSince = nil
 		lastSend = now
 		return true
 	elseif full.stage == "wait" then
@@ -1475,6 +1607,7 @@ function HS.SendNameSearch()
 	end
 	local now = GetTime()
 	s.sent = now
+	lineFreeSince = nil
 	lastSend = now -- the regular searching waits its turn
 	sendTimes[#sendTimes + 1] = now
 	C_AuctionHouse.SendBrowseQuery({ searchString = s.text, sorts = sorts, filters = {}, itemClassFilters = {} })
@@ -1902,7 +2035,7 @@ local function BuildSettingsPanel(p)
 	-- Other
 	Text(p, "GameFontNormal", 2, -94, 200):SetText("Other")
 	Button(p, "How it works (full guide)", 290, -92, 166, 20, function() HS.ShowGuide() end)
-	Text(p, "GameFontNormalSmall", 2, -116, 220):SetText("Search every (seconds):")
+	Text(p, "GameFontNormalSmall", 2, -116, 220):SetText("Search every (sec):")
 	Button(p, "-", 236, -112, 22, 20, function()
 		db.interval = math.max(MIN_INTERVAL, math.floor((db.interval - 0.1) * 10 + 0.5) / 10)
 		HS.Refresh()
@@ -2120,7 +2253,10 @@ local function BuildFrame()
 	f:SetBackdropColor(0.05, 0.06, 0.07, 0.95)
 	f:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
 	f:Hide()
-	f:SetScript("OnHide", function() scanning = false end)
+	f:SetScript("OnHide", function()
+		scanning = false
+		ClearCheckSoon()
+	end)
 
 	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("TOPLEFT", 10, -9)
@@ -2132,6 +2268,7 @@ local function BuildFrame()
 	Tip(Button(f, "?", 330, -7, 22, 20, function() HS.ShowGuide() end), "How it works (full guide)")
 	ui.startBtn = Button(f, "Start", 356, -7, 80, 20, function()
 		scanning = not scanning
+		if not scanning then ClearCheckSoon() end
 		SetStatus(scanning and "Scanning..." or "Paused.", 0.8, 0.8, 0.8)
 		HS.Refresh()
 	end)
@@ -2273,7 +2410,7 @@ There are no pop-ups to click through. These rules protect you instead:
 - Count down resets after: how long the Focus count down waits before starting over.
 
 ]] .. H .. [[Other|r
-- Search every: how often it searches. 0.6 seconds is the fastest the game allows.
+- Search every: how often it searches, on both tabs. 0.6 seconds is the fastest the game allows.
 - Play a sound when a deal appears.
 - Start searching when the auction house opens.
 - Lock window position: stops the window from being dragged.]] },
@@ -2281,6 +2418,8 @@ There are no pop-ups to click through. These rules protect you instead:
 	{ title = "Tips and limits", text = H .. [[Tips and limits|r
 
 - The game allows about 100 auction searches a minute, shared by everything you run. If another addon or app is scanning the auction house at the same time, both slow down.
+- Selling: the auction house handles one request at a time and greys out its Create Auction button while one is waiting. So while you're selling, the shopping list pauses by itself (the marker says "Paused: selling") and carries on about 30 seconds after you post. If anything else is using the auction house (its own window, another addon), it waits about 10 seconds ("Waiting: AH busy"). Focus never pauses, because it's for racing.
+- Mouse on the auction house: while your mouse is over the auction house window, searching eases off to one search every 2 seconds, so its buttons (like Create Auction) stay usable. The marker says "easy: mouse on AH". Move the mouse back to Helpme Sniper (or anywhere else) and it's full speed again.
 - The auction house handles one purchase at a time, so items are bought one after another, not all at once.
 - On a shopping list, ticked items take turns. With 4 items, each is checked about every 2.4 seconds. Finished items are skipped, so the rest speed up.
 - Normal prices come from the auction house copies over the last 14 days, recent days counting most.
@@ -2578,7 +2717,7 @@ local function RefreshSettings()
 		local cfg = L.items[id]
 		if cfg and cfg.enabled ~= false and not ItemDone(L, cfg) then active = active + 1 end
 	end
-	ui.speedNote:SetText(("Focus: your one item is checked every %.1fs. Shopping list: %d items take turns, each about every %.1fs."):format(db.interval, active, db.interval * math.max(1, active)))
+	ui.speedNote:SetText(("One search every %.1fs (every %.0fs while your mouse is on the auction house window). Focus: your one item. Shopping list: %d items take turns, each about every %.1fs. The shopping list pauses while you sell; Focus never does."):format(db.interval, HOVER_INTERVAL, active, db.interval * math.max(1, active)))
 	ui.soundCheck:SetChecked(db.sound)
 	ui.autoCheck:SetChecked(db.autoStart)
 	ui.lockCheck:SetChecked(db.locked)
@@ -2902,6 +3041,12 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		scanning = false
 		pending = nil
 		awaiting = nil
+		lineFreeSince = nil
+		othersUntil = 0
+		ui.pauseShown = nil
+		ui.mouseOnAH = nil
+		ui.focusSellTip = nil
+		ClearCheckSoon()
 		ui.frame:Hide()
 
 	elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
@@ -2948,6 +3093,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" then
+		lineFreeSince = lineFreeSince or GetTime()
 		if pending and pending.stage == "waitline" then
 			SendConfirm(true)
 			HS.Refresh()
@@ -3122,6 +3268,7 @@ SlashCmdList.HELPMESNIPER = function(msg)
 		scanning = true
 	elseif cmd == "stop" then
 		scanning = false
+		ClearCheckSoon()
 	elseif cmd == "show" then
 		if ui.frame then ui.frame:Show() end
 	else
