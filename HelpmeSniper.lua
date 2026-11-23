@@ -11,8 +11,9 @@
 --   History        what you bought and how much you spent today
 --
 -- Buying: one press of the buy key asks the auction house for the exact price (the game
--- requires a real key press for that). When the price comes back at or under your max, the
--- addon buys straight away. If the game ever refuses the automatic buy, it falls back to
+-- requires a real key press for that). When the price comes back with the average at or under
+-- your max, the addon buys straight away. On a fresh deal the first press buys the cheapest
+-- listing, the next press the rest. If the game ever refuses the automatic buy, it falls back to
 -- "press again to buy". Spamming the key is safe: extra presses are ignored while a buy is
 -- in progress. A typo guard refuses to buy when your max is over double the usual price.
 -- Works only for items sold by quantity (cloth, herbs, dye, ...), not gear or bags.
@@ -60,7 +61,10 @@ local MIN_SAMPLES = 10 -- scans needed before "Typical" is trusted
 local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 6, 20, 8
 -- While a deal is on screen, search less often so the auction house line is free the
 -- instant you press buy (a search in flight can delay or swallow the price request).
-local DEAL_INTERVAL = 2.0
+-- 1 second (was 2): a deal someone else bought disappears from your screen sooner, so fewer
+-- presses go to deals that are already gone. Bind Buy to the mouse wheel and a press that
+-- lands during a search costs almost nothing: the next wheel notch follows right after.
+local DEAL_INTERVAL = 1.0
 -- Mouse over the auction house window (you're doing something there, like selling): search
 -- only this often, so its own buttons (like Create Auction) stay usable. Anywhere else,
 -- including over our window, searching runs at full speed.
@@ -502,6 +506,18 @@ local function Fill(cfg, under, typo)
 	return avail, total
 end
 
+-- How many the next press buys, and their cost. First bite: on a fresh deal, just the
+-- cheapest listing. That's the one everyone races for, and a small buy is less likely to be
+-- spoiled by someone else's purchase landing first. The press after that buys the rest in
+-- one go (no new search needed).
+function HS.NextBite(r)
+	local first = r.under and r.under[1]
+	if not r.firstTaken and first and first.qty > 0 and first.qty < r.avail then
+		return first.qty, first.qty * first.price
+	end
+	return r.avail, r.total
+end
+
 local function Evaluate(itemID)
 	local cfg = Cfg(itemID)
 	if not cfg then return end
@@ -583,13 +599,15 @@ function HelpmeSniper_BuyStep()
 	end
 	local r = results[id]
 	local cfg = Cfg(id)
+	local qty, expected = HS.NextBite(r)
+	r.firstTaken = true
 	pending = {
-		itemID = id, qty = r.avail, expected = r.total, max = r.max, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now(),
+		itemID = id, qty = qty, expected = expected, max = r.max, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now(),
 		cfg = cfg, list = (cfg and cfg.kind == "list") and ActiveList() or nil, -- where to count the purchase
 	}
 	lineFreeSince = nil
-	C_AuctionHouse.StartCommoditiesPurchase(id, r.avail)
-	SetStatus(("Getting price for %d %s..."):format(r.avail, ItemName(id)), 1, 1, 0)
+	C_AuctionHouse.StartCommoditiesPurchase(id, qty)
+	SetStatus(("Getting price for %d %s..."):format(qty, ItemName(id)), 1, 1, 0)
 	HS.Refresh()
 end
 
@@ -2389,18 +2407,20 @@ The button shows what a click will do:
 - |cffff5555Red:|r your max looks like a typo.
 
 - ]] .. H .. [[One click:|r the click asks the auction house for the exact price, and the addon buys straight away if it's still at or under your max. If the game ever refuses that, the addon switches to "click again to buy" by itself.
+- ]] .. H .. [[Cheapest first:|r on a new deal, the first click buys just the cheapest listing (the one everyone races for). The next click buys the rest in one go.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
-- ]] .. H .. [[Someone beat you?|r If the price comes back over your max, it cancels and nothing is bought.]] },
+- ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
+- ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
 
 There are no pop-ups to click through. These rules protect you instead:
 
-- ]] .. H .. [[Max price:|r every buy costs no more than the price it showed you, which is at or under your max.
+- ]] .. H .. [[Max price:|r every buy averages at or under your max per item.
 - ]] .. H .. [[Never spend below:|r your gold never drops under this amount (set it in Settings).
 - ]] .. H .. [[Totals:|r Count down (Focus) and Track totals (Shopping List) never buy more than your amount.
 - ]] .. H .. [[Typo guard:|r if a price you typed is more than double the usual price (say 20g instead of 20c), it warns you and won't buy until you click "I meant it". That only covers that exact price.
-- ]] .. H .. [[Price check:|r every buy gets the exact price first. If it's higher than what it showed you (say someone bought the cheap ones first), or more than you can spend, it cancels and searches again right away.]] },
+- ]] .. H .. [[Price check:|r every buy gets the exact price first. If the average is over your max (say someone bought the cheap ones first), or it's more than you can spend, it cancels and searches again right away.]] },
 
 	{ title = "Settings", text = H .. [[Settings|r
 
@@ -2539,7 +2559,8 @@ local function RefreshBuy()
 		SetBuy(("Getting price for %d %s..."):format(pending.qty, ItemName(pending.itemID)), 1, 0.82, 0)
 	elseif target then
 		local r = results[target]
-		SetBuy(("BUY %d %s · %s each (max %s)"):format(r.avail, ItemName(target), MoneyPlain(r.total / r.avail), MoneyPlain(r.max or 0)), 0.3, 1, 0.3)
+		local bq, bt = HS.NextBite(r)
+		SetBuy(("BUY %d %s · %s each (max %s)"):format(bq, ItemName(target), MoneyPlain(bt / bq), MoneyPlain(r.max or 0)), 0.3, 1, 0.3)
 	else
 		-- Nothing to buy: on the Focus tab, say why if it's something you can fix.
 		local id = db.mode == "focus" and db.focusItem
@@ -3057,13 +3078,12 @@ ev:SetScript("OnEvent", function(_, event, ...)
 	elseif event == "COMMODITY_PRICE_UPDATED" then
 		local _, totalPrice = ...
 		if pending and pending.stage == "quoting" then
-			-- Never pay more than what the addon showed you (already at or under your max). If
-			-- someone bought the cheap ones first, it cancels and searches again right away.
-			local cap = pending.expected
-			if pending.max then cap = math.min(cap, pending.max * pending.qty) end
 			-- Accept if the average price stays at or under your max and you can afford it.
-			-- If someone bought the cheapest ones first, the leftovers are fine as long as
-			-- they're still under your max.
+			-- If someone bought part of the cheap ones first, the price is usually a bit
+			-- higher than shown; that's still a win as long as the average is within your max,
+			-- so the race isn't thrown away over a few coppers. Over your max: cancel and
+			-- search again right away.
+			local cap = pending.max and (pending.max * pending.qty) or pending.expected
 			if totalPrice <= cap and totalPrice <= Spendable() then
 				pending.quote = totalPrice
 				pending.t = GetTime()
@@ -3083,7 +3103,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				if totalPrice > Spendable() then
 					SetStatus(("Price came back at %s, more than you can spend. Cancelled, nothing bought."):format(Money(totalPrice)), 1, 0.4, 0.4)
 				else
-					SetStatus(("Price came back over your max (%s vs %s). Someone beat you. Cancelled, nothing bought."):format(Money(totalPrice), Money(pending.expected)), 1, 0.4, 0.4)
+					SetStatus(("Price came back over your max (%s, max %s). Someone beat you. Cancelled, nothing bought."):format(Money(totalPrice), Money(cap)), 1, 0.4, 0.4)
 				end
 				results[pending.itemID] = nil
 				priorityID = pending.itemID -- look again right away

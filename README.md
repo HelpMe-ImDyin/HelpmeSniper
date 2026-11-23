@@ -2,7 +2,7 @@
 
 A small World of Warcraft **Forever** addon for buying auction house materials fast: cloth, dye, herbs, anything sold by quantity.
 
-You set a max price and how many you want. The addon searches the auction house on its own and shows a big **YES** the moment something is listed at or under your price. Click BUY: the addon gets the exact price and buys straight away if it's still at or under your max. Keep clicking to keep buying; it doesn't wait for a new search between buys. If someone beats you and the price comes back higher, it cancels automatically, so you never pay more than your max.
+You set a max price and how many you want. The addon searches the auction house on its own and shows a big **YES** the moment something is listed at or under your price. Click BUY: the addon gets the exact price and buys straight away if the average is still at or under your max. Keep clicking to keep buying; it doesn't wait for a new search between buys. If someone beats you and the price comes back over your max, it cancels automatically, so you never pay more than your max on average.
 
 It works on its own; you don't need any other addon.
 
@@ -59,7 +59,9 @@ Shift-click the - and + buttons to change an amount by 10.
 
 ### Safety, without pop-ups
 
-- Your max price per item: every buy costs no more than the price it showed you, which is at or under your max. If the price changes (someone bought the cheap ones first), it cancels and searches again.
+- Your max price per item: every buy averages at or under your max. If someone bought part of the cheap ones first, a price a little higher than shown is still bought as long as the average stays within your max; over your max, it cancels and searches again.
+- Cheapest first: on a new deal, the first press buys just the cheapest listing (the one everyone races for); the next press buys the rest.
+- Fastest buying: bind Buy to your mouse wheel (Key Bindings → AddOns → Helpme Sniper). Each wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
 - Typo guard: if a price you typed is more than double the usual price (say 20g instead of 20c), it warns you and won't buy until you click "I meant it".
 - "Never spend below": your gold never drops under this amount.
 - Count down and Track totals: never buys more than your amount.
