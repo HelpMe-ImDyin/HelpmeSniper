@@ -61,6 +61,7 @@ Shift-click the - and + buttons to change an amount by 10.
 
 - Your max price per item: every buy averages at or under your max. If someone bought part of the cheap ones first, a price a little higher than shown is still bought as long as the average stays within your max; over your max, it cancels and searches again.
 - Cheapest first: on a new deal, the first press buys just the cheapest listing (the one everyone races for); the next press buys the rest.
+- Race counter: type `/hsnipe stats` to see how many buys you won and where you lost the rest (final buy, price over your max, already gone), with average times for each step. It also prints when you close the auction house. `/hsnipe stats reset` starts it over.
 - Fastest buying: bind Buy to your mouse wheel (Key Bindings → AddOns → Helpme Sniper). Each wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
 - Typo guard: if a price you typed is more than double the usual price (say 20g instead of 20c), it warns you and won't buy until you click "I meant it".
 - "Never spend below": your gold never drops under this amount.

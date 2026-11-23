@@ -180,6 +180,46 @@ local function PlayAlert()
 	if db.sound then pcall(PlaySound, (SOUNDKIT and SOUNDKIT.RAID_WARNING) or 8959) end
 end
 
+-- ----------------------------------------------------------------------------
+-- Race counter: where purchases are won and lost, and how long each step takes.
+-- Kept in the saved data (db.stats, since the last reset) and for this auction house
+-- visit (visit). /hsnipe stats shows it; /hsnipe stats reset starts over.
+-- ----------------------------------------------------------------------------
+local visit = {}
+
+local function Stat(key)
+	db.stats = db.stats or { since = time() }
+	for _, s in ipairs({ db.stats, visit }) do s[key] = (s[key] or 0) + 1 end
+end
+
+-- Adds one timing (in seconds) to the average for key.
+local function Timing(key, seconds)
+	if not seconds or seconds < 0 or seconds > 30 then return end
+	db.stats = db.stats or { since = time() }
+	for _, s in ipairs({ db.stats, visit }) do
+		s[key .. "Sum"] = (s[key .. "Sum"] or 0) + seconds
+		s[key .. "N"] = (s[key .. "N"] or 0) + 1
+	end
+end
+
+function HS.StatsText(s, label)
+	local tries = s.tries or 0
+	if tries == 0 then return { label .. ": no purchases tried yet." } end
+	local won = s.won or 0
+	local lines = {
+		("%s: %d tries, %d won (%d%%)."):format(label, tries, won, math.floor(won * 100 / tries + 0.5)),
+		("Lost: %d at the final buy (someone else's buy landed first: \"internal auction house error\"), %d price came back over your max (someone bought the cheap ones first), %d already gone, %d timed out, %d over your spending money.")
+			:format(s.lostFinal or 0, s.lostPrice or 0, s.lostGone or 0, s.timeout or 0, s.lostMoney or 0),
+	}
+	local function avg(key)
+		local n = s[key .. "N"] or 0
+		return n > 0 and ("%.2fs"):format(s[key .. "Sum"] / n) or "?"
+	end
+	lines[#lines + 1] = ("Average times: you pressed %s after a deal appeared; the deal's info was %s old when you pressed; price check took %s; waiting for the line %s; final buy took %s.")
+		:format(avg("react"), avg("age"), avg("quote"), avg("wait"), avg("buy"))
+	return lines
+end
+
 local function CancelQuote()
 	if C_AuctionHouse and C_AuctionHouse.CancelCommoditiesPurchase then
 		pcall(C_AuctionHouse.CancelCommoditiesPurchase)
@@ -541,7 +581,9 @@ local function Evaluate(itemID)
 	local typoRef = max and TypoRef(cfg, itemID, max, cheapest)
 	local avail, total = Fill(cfg, under, typoRef)
 	local prev = results[itemID]
-	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, under = under, time = GetTime(), typo = typoRef, max = max }
+	-- dealAt: when this deal first showed up (kept while it stays a deal), for the race counter.
+	local dealAt = avail > 0 and ((prev and prev.avail > 0 and prev.dealAt) or GetTime()) or nil
+	results[itemID] = { avail = avail, total = total, cheapest = cheapest, listings = listings, under = under, time = GetTime(), typo = typoRef, max = max, dealAt = dealAt }
 	local relevant = db.mode ~= "focus" or itemID == focusID -- don't announce other items while on Focus
 	if avail > 0 and (not prev or prev.avail == 0) and relevant then
 		PlayAlert()
@@ -561,6 +603,7 @@ end
 
 -- The final "buy" for the price we were quoted. auto = sent by the addon, not by a key press.
 local function SendConfirm(auto)
+	if pending.tQuoted then Timing("wait", GetTime() - pending.tQuoted) end
 	pending.stage = "buying"
 	pending.auto = auto
 	pending.t = GetTime()
@@ -600,9 +643,13 @@ function HelpmeSniper_BuyStep()
 	local r = results[id]
 	local cfg = Cfg(id)
 	local qty, expected = HS.NextBite(r)
+	local now = GetTime()
+	Stat("tries")
+	if not r.firstTaken and r.dealAt then Timing("react", now - r.dealAt) end
+	Timing("age", now - (r.time or now))
 	r.firstTaken = true
 	pending = {
-		itemID = id, qty = qty, expected = expected, max = r.max, stage = "quoting", t = GetTime(), moneyAtStart = Money_Now(),
+		itemID = id, qty = qty, expected = expected, max = r.max, stage = "quoting", t = now, tStart = now, moneyAtStart = Money_Now(),
 		cfg = cfg, list = (cfg and cfg.kind == "list") and ActiveList() or nil, -- where to count the purchase
 	}
 	lineFreeSince = nil
@@ -765,6 +812,7 @@ local function Tick()
 		end
 		local limit = (pending.stage == "buying" and BUY_TIMEOUT) or ((pending.stage == "quoting" or pending.stage == "waitline") and QUOTE_TIMEOUT) or READY_TIMEOUT
 		if now - pending.t > limit then
+			Stat("timeout")
 			if pending.stage ~= "buying" then CancelQuote() end
 			SetStatus("Timed out, cancelled. Nothing was bought.", 1, 0.6, 0.2)
 			pending = nil
@@ -3011,6 +3059,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 	if event == "AUCTION_HOUSE_SHOW" then
 		ahOpen = true
 		results = {}
+		visit = {} -- the race counter's "this visit" starts over
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3054,6 +3103,9 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "AUCTION_HOUSE_CLOSED" then
+		if (visit.tries or 0) > 0 then
+			for _, line in ipairs(HS.StatsText(visit, "This visit")) do Print(line) end
+		end
 		HS.ClosePicker()
 		full = nil -- not finished: it tries again next time
 		if ui.listMenu then ui.listMenu:Hide() end
@@ -3084,9 +3136,11 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- so the race isn't thrown away over a few coppers. Over your max: cancel and
 			-- search again right away.
 			local cap = pending.max and (pending.max * pending.qty) or pending.expected
+			Timing("quote", GetTime() - (pending.tStart or GetTime()))
 			if totalPrice <= cap and totalPrice <= Spendable() then
 				pending.quote = totalPrice
 				pending.t = GetTime()
+				pending.tQuoted = pending.t
 				if db.autoBuy and not db.autoBuyBlocked then
 					if LineReady() then
 						SendConfirm(true)
@@ -3100,6 +3154,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				end
 			else
 				CancelQuote()
+				Stat(totalPrice > Spendable() and totalPrice <= cap and "lostMoney" or "lostPrice")
 				if totalPrice > Spendable() then
 					SetStatus(("Price came back at %s, more than you can spend. Cancelled, nothing bought."):format(Money(totalPrice)), 1, 0.4, 0.4)
 				else
@@ -3134,6 +3189,8 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
 	elseif event == "COMMODITY_PRICE_UNAVAILABLE" then
 		if pending then
+			Stat("lostGone")
+			Timing("quote", GetTime() - (pending.tStart or GetTime()))
 			SetStatus("Those auctions are gone. Nothing bought.", 1, 0.4, 0.4)
 			results[pending.itemID] = nil
 			pending = nil
@@ -3142,6 +3199,8 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
 	elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then
 		if pending then
+			Stat("won")
+			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			local total = pending.quote or pending.expected
 			table.insert(db.history, 1, { t = time(), id = pending.itemID, qty = pending.qty, total = total })
 			while #db.history > 50 do table.remove(db.history) end
@@ -3215,6 +3274,8 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
 	elseif event == "COMMODITY_PURCHASE_FAILED" then
 		if pending then
+			Stat("lostFinal")
+			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			SetStatus("Purchase failed (someone else got it?). Nothing bought.", 1, 0.4, 0.4)
 			results[pending.itemID] = nil
 			priorityID = pending.itemID
@@ -3291,8 +3352,21 @@ SlashCmdList.HELPMESNIPER = function(msg)
 		ClearCheckSoon()
 	elseif cmd == "show" then
 		if ui.frame then ui.frame:Show() end
+	elseif cmd == "stats" then
+		if (args[2] or ""):lower() == "reset" then
+			db.stats = { since = time() }
+			visit = {}
+			Print("Race counter reset.")
+		else
+			local s = db.stats or {}
+			local label = s.since and ("Since " .. date("%b %d %H:%M", s.since)) or "So far"
+			for _, line in ipairs(HS.StatsText(s, label)) do Print(line) end
+			if (visit.tries or 0) > 0 then
+				for _, line in ipairs(HS.StatsText(visit, "This visit")) do Print(line) end
+			end
+		end
 	else
-		Print("open the auction house and use the window. Commands: /hsnipe add, remove, list, start, stop, show")
+		Print("open the auction house and use the window. Commands: /hsnipe add, remove, list, start, stop, show, stats (stats reset starts the race counter over)")
 	end
 	HS.Refresh()
 end
