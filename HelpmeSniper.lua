@@ -102,6 +102,10 @@ local sellUntil, othersUntil = 0, 0 -- searching pauses until these times (you'r
 local lineFreeSince -- when the auction house line last became free (nil while it's busy)
 local lastPress = 0 -- when the buy key / wheel was last pressed (searches pause while you keep pressing)
 local scanFails, scanOff = 0, false -- wheel price checks with no price at all in a row; off for this visit
+-- Growing price checks (v0.7.7): after a price-check buy, the next check asks for double
+-- (5, 10, 20, 40...), so a big cheap batch is cleared in a few buys. Back to the starting
+-- size after any miss, a lost race, a different item, or 10 seconds without a buy.
+local scanBatch, scanBatchID, scanBatchAt
 local checkSoon = {} -- shopping list items the last full copy says may be a deal: check live first
 local function ClearCheckSoon()
 	for k in pairs(checkSoon) do checkSoon[k] = nil end
@@ -673,9 +677,11 @@ local function ScanPress()
 		SetStatus(("Got all %d %s. Reset the count to buy more."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
 		return true
 	end
-	-- A small batch: deals are usually a few cheap ones, and asking for a big amount would bring
-	-- the average over your max (cheap silk is often bought 1 to 9 at a time).
-	qty = math.min(qty, db.wheelQty or 5, math.floor(Spendable() / max))
+	-- Start small: deals are usually a few cheap ones, and asking for a big amount would bring
+	-- the average over your max (cheap silk is often bought 1 to 9 at a time). After a buy the
+	-- batch doubles (scanBatch), so a big cheap batch is cleared in a few buys.
+	if scanBatchID ~= id or GetTime() - (scanBatchAt or 0) > 10 then scanBatch = nil end
+	qty = math.min(qty, scanBatch or db.wheelQty or 5, math.floor(Spendable() / max))
 	if qty <= 0 then
 		SetStatus("Not enough gold above your \"never spend below\" amount.", 1, 0.4, 0.4)
 		return true
@@ -2558,7 +2564,7 @@ The button shows what a click will do:
 - ]] .. H .. [[Cheapest first:|r on a new deal, the first click buys just the cheapest listing (the one everyone races for). The next click buys the rest in one go.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
 - ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
-- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a hit it looks at the listings, and your next press buys the rest of the cheap batch, cheapest first, up to your amount. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
+- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a buy, the next check asks for double (5, 10, 20, 40...) up to what's left of your amount, so a big cheap batch goes in a few buys; back to the starting size when a check comes back over your max. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
 - ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
@@ -3167,6 +3173,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		results = {}
 		visit = {} -- the race counter's "this visit" starts over
 		scanFails, scanOff = 0, false
+		scanBatch = nil
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3250,6 +3257,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				-- No cancel: the next price check replaces this one (TSM never cancels either), and a
 				-- cancel could take a turn in the game's queue ahead of your next check.
 				Stat("scanNo")
+				scanBatch = nil -- back to the starting size
 				SetStatus(("Price check: %s each, over your max %s. Keep pressing."):format(Money(math.floor(totalPrice / pending.qty)), Money(pending.max)), 0.8, 0.8, 0.8)
 				pending = nil
 				HS.Refresh()
@@ -3387,9 +3395,13 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- so your very next click can buy the rest without waiting for a new search.
 			-- (Every buy is still price-checked first, so stale info can never overspend.)
 			local id = pending.itemID
-			-- A price-check buy: listings from before you started pressing are out of date.
-			-- Forget them so the search below shows the rest of the batch fresh.
-			if pending.scan then results[id] = nil end
+			-- A price-check buy: listings from before you started pressing are out of date, so
+			-- forget them. The next price check asks for double (no search in between: a search
+			-- is one more wait in the game's queue, and that path won far fewer races).
+			if pending.scan then
+				results[id] = nil
+				scanBatch, scanBatchID, scanBatchAt = pending.qty * 2, id, GetTime()
+			end
 			local r = results[id]
 			local more = 0
 			if cfg and r and r.under then
@@ -3427,7 +3439,10 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			end
 			-- Nothing left to buy: search again right away. More left: keep the line free for
 			-- your next click (the listings refresh on the slower deal pace instead).
-			if more == 0 then priorityID = id end
+			if pending.scan and scanBatch and cfg and Remaining(cfg) > 0 then
+				SetStatus(("Bought %d! Keep pressing: the next check asks for %d."):format(pending.qty, math.min(scanBatch, Remaining(cfg))), 0.3, 1, 0.3)
+			end
+			if more == 0 and not pending.scan then priorityID = id end
 			pending = nil
 			HS.Refresh()
 		end
@@ -3460,7 +3475,11 @@ ev:SetScript("OnEvent", function(_, event, ...)
 					SetStatus("Those auctions are gone. Nothing bought. Searching again...", 1, 0.4, 0.4)
 				end
 				results[pending.itemID] = nil
-				priorityID = pending.itemID -- look again right away
+				if pending.scan then
+					scanBatch = nil -- someone else got it: start small again, keep checking
+				else
+					priorityID = pending.itemID -- look again right away
+				end
 				pending = nil
 				HS.Refresh()
 			end
@@ -3472,7 +3491,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			SetStatus("Purchase failed (someone else got it?). Nothing bought.", 1, 0.4, 0.4)
 			results[pending.itemID] = nil
-			priorityID = pending.itemID
+			if pending.scan then scanBatch = nil else priorityID = pending.itemID end
 			pending = nil
 			HS.Refresh()
 		end
