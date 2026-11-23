@@ -33,8 +33,8 @@ local DEFAULTS = {
 	sound = true,
 	locked = false, -- drag the window anywhere; tick "Lock window position" in Settings to pin it
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
-	wheelCheck = false, -- Focus: a press with no deal on screen asks the game for a small batch's price (off: buys whole batches from searches)
-	wheelQty = 5, -- how many each of those price checks asks for (a whole big amount would almost never average under the max)
+	wheelCheck = true, -- Focus: a press with no deal on screen asks the game for the price directly
+	wheelQty = 20, -- how many the first price check asks for (after a buy: the rest of your amount)
 	countdown = true, -- Focus: quantity is a hard total (untick to buy up to the quantity on every click)
 	resetMinutes = 5, -- Focus count down starts over after this many minutes without buying that item
 	reserve = 5000, -- keep 50s
@@ -102,10 +102,17 @@ local sellUntil, othersUntil = 0, 0 -- searching pauses until these times (you'r
 local lineFreeSince -- when the auction house line last became free (nil while it's busy)
 local lastPress = 0 -- when the buy key / wheel was last pressed (searches pause while you keep pressing)
 local scanFails, scanOff = 0, false -- wheel price checks with no price at all in a row; off for this visit
--- Growing price checks (v0.7.7): after a price-check buy, the next check asks for double
--- (5, 10, 20, 40...), so a big cheap batch is cleared in a few buys. Back to the starting
--- size after any miss, a lost race, a different item, or 10 seconds without a buy.
+-- Price check sizes (v0.7.9): the first check asks for 20 (db.wheelQty). After a price-check
+-- buy, the next asks for the rest of your amount (scanBatch = math.huge). Back to 20 after a
+-- check with nothing cheap in it, a lost race, a different item, or 10 seconds without a buy.
 local scanBatch, scanBatchID, scanBatchAt
+-- Listings above your max from the last search, cheapest first: what a price check costs
+-- when there's nothing cheap in it. [itemID] = { t, max, units, rows = { {price, qty}... } }
+local ladders = {}
+-- When a check's answer shows some cheap ones, how many: the next press asks for exactly that.
+-- origQty/origTotal: the answer it came from (after that buy, what's left of it is re-read
+-- with the price the cheap ones really cost, for the press after).
+local scanFollow -- { id, qty, t, origQty, origTotal }
 local checkSoon = {} -- shopping list items the last full copy says may be a deal: check live first
 local function ClearCheckSoon()
 	for k in pairs(checkSoon) do checkSoon[k] = nil end
@@ -235,6 +242,10 @@ function HS.StatsText(s, label)
 	if (s.scanTries or 0) > 0 then
 		lines[#lines + 1] = ("Wheel price checks: %d sent, %d found your amount within your max (counted in tries above, %d won), %d over your max, %d got no price; each took %s.")
 			:format(s.scanTries, s.scanHits or 0, s.scanWon or 0, s.scanNo or 0, s.scanNone or 0, avg("scanQuote"))
+		if (s.scanSized or 0) > 0 then
+			lines[#lines + 1] = ("Cheap ones spotted from an over-max answer: %d times. The next check, sized to them: %d within your max (%d won), %d over.")
+				:format(s.scanSized, s.scanFollowHits or 0, s.scanFollowWon or 0, s.scanFollowNo or 0)
+		end
 	end
 	return lines
 end
@@ -592,6 +603,22 @@ local function Evaluate(itemID)
 		if cheapEnough and q > 0 then under[#under + 1] = { price = price, qty = q } end
 		if i >= LISTING_ROWS and not cheapEnough then break end
 	end
+	if max then
+		-- Listings above your max (yours skipped), up to 1000: what a price check normally
+		-- costs, so a cheaper answer shows how many cheap ones appeared (HS.SizeFromAnswer).
+		local rows, units = {}, 0
+		for i = 1, n do
+			local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
+			if not info then break end
+			local q = (info.quantity or 0) - (info.numOwnerItems or 0)
+			if info.unitPrice > max and q > 0 then
+				rows[#rows + 1] = { price = info.unitPrice, qty = q }
+				units = units + q
+				if units >= 1000 then break end
+			end
+		end
+		ladders[itemID] = { t = GetTime(), max = max, units = units, rows = rows }
+	end
 	local typoRef = max and TypoRef(cfg, itemID, max, cheapest)
 	local avail, total = Fill(cfg, under, typoRef)
 	local prev = results[itemID]
@@ -627,8 +654,8 @@ local function SendConfirm(auto)
 end
 
 -- ----------------------------------------------------------------------------
--- Wheel price checks (v0.7.6). On Focus, a press with no deal on screen asks the game
--- straight away what your amount would cost, instead of waiting for a search to spot the deal.
+-- Wheel price checks (v0.7.6, sizes v0.7.9). On Focus, a press with no deal on screen asks the
+-- game straight away what a batch would cost, instead of waiting for a search to spot the deal.
 -- That takes one request (the search) out of the race: every request waits about 0.4 s in the
 -- game's queue, so a race was search + price + buy. If the price averages at or under your
 -- max, it buys (the same check as every other buy); if not, nothing is bought.
@@ -636,6 +663,52 @@ end
 -- If the game gives no price several times in a row, this turns itself off for the visit.
 -- ----------------------------------------------------------------------------
 local SCAN_FAILS_MAX = 4
+
+-- Cost of the cheapest k units on a normal-cost list, or nil if it doesn't have k.
+function HS.LadderCost(lad, k)
+	if k <= 0 then return 0 end
+	local cost, left = 0, k
+	for _, r in ipairs(lad.rows) do
+		local take = math.min(r.qty, left)
+		cost, left = cost + take * r.price, left - take
+		if left <= 0 then return cost end
+	end
+	return nil
+end
+
+-- What the cheap ones probably cost each: the middle of your recent buys of this item that
+-- averaged within your max, else 90% of your max. (A guess on the low side makes the next
+-- check ask for fewer, which is the safe direction: the check after that picks up the rest.)
+function HS.DealPriceGuess(history, id, max)
+	local avgs = {}
+	for _, h in ipairs(history or {}) do
+		if h.id == id and (h.qty or 0) > 0 and h.total / h.qty <= max then avgs[#avgs + 1] = h.total / h.qty end
+	end
+	if #avgs == 0 then return math.floor(max * 0.9) end
+	table.sort(avgs)
+	return math.floor(avgs[math.ceil(#avgs / 2)])
+end
+
+-- A price check came back over your max. If it's clearly cheaper than the normal cost of that
+-- many (the listings above your max from the last search), some cheap ones are in it. Works out
+-- roughly how many (L cheap at the guessed price + the cheapest normal ones for the rest = the
+-- answer), so the next press asks for just those. Nil when nothing cheap shows. The next check
+-- still has to average at or under your max before anything is bought, so a wrong guess only
+-- costs one press.
+function HS.SizeFromAnswer(lad, qty, total, max, guess)
+	if not lad or lad.max ~= max or qty < 2 then return nil end
+	local normal = HS.LadderCost(lad, qty)
+	if not normal then return nil end
+	if total >= normal - math.max(qty, math.floor(normal * 0.005)) then return nil end
+	local step = lad.rows[1].price - guess -- how much cheaper each cheap one is than normal
+	if step <= 0 then return nil end
+	local slack = math.floor(step / 2) -- round to the nearest count, not up
+	for L = 1, qty - 1 do
+		local rest = HS.LadderCost(lad, qty - L)
+		if rest and L * guess + rest <= total + slack then return L end
+	end
+	return qty - 1
+end
 
 local function ScanFailed(why)
 	Stat("scanNone")
@@ -672,11 +745,22 @@ local function ScanPress()
 		SetStatus(("Got all %d %s. Reset the count to buy more."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
 		return true
 	end
-	-- Start small: deals are usually a few cheap ones, and asking for a big amount would bring
-	-- the average over your max (cheap silk is often bought 1 to 9 at a time). After a buy the
-	-- batch doubles (scanBatch), so a big cheap batch is cleared in a few buys.
+	-- How many to ask for: the number the last answer showed (scanFollow), else the rest of
+	-- your amount right after a buy (scanBatch), else 20 (db.wheelQty). A batch of 20 or more
+	-- is bought in one go; a smaller one shows up as a cheaper-than-normal answer, and the
+	-- next press asks for just that many.
 	if scanBatchID ~= id or GetTime() - (scanBatchAt or 0) > 10 then scanBatch = nil end
-	qty = math.min(qty, scanBatch or db.wheelQty or 5, math.floor(Spendable() / max))
+	local sf = scanFollow and scanFollow.id == id and GetTime() - scanFollow.t < 3 and scanFollow or nil
+	local follow = sf and sf.qty
+	scanFollow = nil
+	local want = follow or scanBatch or db.wheelQty or 20
+	if not follow and scanBatch then
+		-- The rest of your amount, but no more than the normal-cost list covers (so a
+		-- cheaper-than-normal answer can still be worked out).
+		local lad = ladders[id]
+		if lad and lad.max == max and lad.units >= (db.wheelQty or 20) then want = math.min(want, lad.units) end
+	end
+	qty = math.min(qty, want, math.floor(Spendable() / max))
 	if qty <= 0 then
 		SetStatus("Not enough gold above your \"never spend below\" amount.", 1, 0.4, 0.4)
 		return true
@@ -685,7 +769,8 @@ local function ScanPress()
 	Stat("scanTries")
 	pending = {
 		itemID = id, qty = qty, expected = max * qty, max = max, stage = "quoting", t = now, tStart = now,
-		moneyAtStart = Money_Now(), cfg = cfg, scan = true,
+		moneyAtStart = Money_Now(), cfg = cfg, scan = true, follow = follow and true or nil,
+		origQty = sf and sf.origQty, origTotal = sf and sf.origTotal,
 	}
 	lineFreeSince = nil
 	C_AuctionHouse.StartCommoditiesPurchase(id, qty)
@@ -2215,7 +2300,7 @@ local function BuildSettingsPanel(p)
 		db.wheelCheck = self:GetChecked() and true or false
 		if db.wheelCheck then scanFails, scanOff = 0, false end
 	end)
-	Tip(ui.wheelCheck, "On Focus, pressing Buy with no deal on screen asks the game what a small\nbatch (5; /hsnipe wheel 3 for 3) costs right now and buys it if it averages\nat or under your max.\nFaster than waiting for a search. Searches pause while you keep pressing.")
+	Tip(ui.wheelCheck, "On Focus, pressing Buy with no deal on screen asks the game what 20\n(/hsnipe wheel 40 for 40) cost right now and buys them if they average\nat or under your max. After a buy, the next check asks for the rest of\nyour amount. Fewer cheap ones: the answer shows how many, and the next\npress asks for just those. Searches pause while you keep pressing.")
 
 	local help = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	help:SetPoint("TOPLEFT", 2, -222)
@@ -2559,7 +2644,7 @@ The button shows what a click will do:
 - ]] .. H .. [[Whole batch:|r a click buys everything listed at or under your max in one go, up to your amount.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
 - ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
-- ]] .. H .. [[Price checks (Focus, off unless you turn them on):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a buy, the next check asks for double (5, 10, 20, 40...) up to what's left of your amount, so a big cheap batch goes in a few buys; back to the starting size when a check comes back over your max. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
+- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what 20 cost right now (one stack; /hsnipe wheel 40 for 40, never more than what's left of your amount) and buys them if they average at or under your max, without waiting for a search to spot the deal. After a buy, the next check asks for the rest of your amount. If only some are cheap, the answer comes back over your max but cheaper than normal; the addon works out about how many cheap ones that means, and the next press asks for just those. Over your max, nothing is bought. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
 - ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
@@ -3125,12 +3210,14 @@ local function InitDB()
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
 	end
-	-- v0.7.8: wheel price checks are off by default now (they bought 5 at a time instead of the
-	-- whole batch under your max). Switch them off once for settings saved by v0.7.6 and v0.7.7.
-	if not db.wheelDefault078 then
-		db.wheelCheck = false
-		db.wheelDefault078 = true
+	-- v0.7.9: price checks start at 20 (one stack) instead of 5, and take the rest of your
+	-- amount after a buy. Turn them on and move the old 5 to 20, once.
+	if not db.wheelDefault079 then
+		db.wheelCheck = true
+		if db.wheelQty == 5 then db.wheelQty = 20 end
+		db.wheelDefault079 = true
 	end
+	db.wheelDefault078 = nil
 	db.interval = math.min(MAX_INTERVAL, math.max(MIN_INTERVAL, db.interval))
 	HS.UpdateMode()
 end
@@ -3174,7 +3261,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		results = {}
 		visit = {} -- the race counter's "this visit" starts over
 		scanFails, scanOff = 0, false
-		scanBatch = nil
+		scanBatch, scanFollow = nil, nil
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3258,8 +3345,23 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				-- No cancel: the next price check replaces this one (TSM never cancels either), and a
 				-- cancel could take a turn in the game's queue ahead of your next check.
 				Stat("scanNo")
+				local id = pending.itemID
 				scanBatch = nil -- back to the starting size
-				SetStatus(("Price check: %s each, over your max %s. Keep pressing."):format(Money(math.floor(totalPrice / pending.qty)), Money(pending.max)), 0.8, 0.8, 0.8)
+				local L = not pending.follow and HS.SizeFromAnswer(ladders[id], pending.qty, totalPrice, pending.max, HS.DealPriceGuess(db.history, id, pending.max))
+				if pending.follow then
+					-- Fewer cheap ones than worked out (someone got some, or the listings above
+					-- your max changed): look at the listings again, which refreshes both.
+					Stat("scanFollowNo")
+					results[id] = nil
+					priorityID = id
+					SetStatus("Fewer cheap ones than worked out. Looking at the listings again...", 1, 1, 0)
+				elseif L then
+					Stat("scanSized")
+					scanFollow = { id = id, qty = L, t = GetTime(), origQty = pending.qty, origTotal = totalPrice }
+					SetStatus(("Cheap ones spotted (about %d). Keep pressing: the next check asks for %d."):format(L, L), 0.3, 1, 0.3)
+				else
+					SetStatus(("Price check: %s each, over your max %s. Keep pressing."):format(Money(math.floor(totalPrice / pending.qty)), Money(pending.max)), 0.8, 0.8, 0.8)
+				end
 				pending = nil
 				HS.Refresh()
 				return
@@ -3268,6 +3370,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				-- Found your amount at your price: from here it's a normal race.
 				Stat("tries")
 				Stat("scanHits")
+				if pending.follow then Stat("scanFollowHits") end
 				PlayAlert()
 			end
 			if totalPrice <= cap and totalPrice <= Spendable() then
@@ -3366,6 +3469,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		if pending then
 			Stat("won")
 			if pending.scan then Stat("scanWon") end
+			if pending.follow then Stat("scanFollowWon") end
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			local total = pending.quote or pending.expected
 			table.insert(db.history, 1, { t = time(), id = pending.itemID, qty = pending.qty, total = total })
@@ -3397,11 +3501,21 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- (Every buy is still price-checked first, so stale info can never overspend.)
 			local id = pending.itemID
 			-- A price-check buy: listings from before you started pressing are out of date, so
-			-- forget them. The next price check asks for double (no search in between: a search
-			-- is one more wait in the game's queue, and that path won far fewer races).
+			-- forget them. The next price check asks for the rest of your amount (no search in
+			-- between: a search is one more wait in the game's queue). If only some of it is
+			-- cheap, that answer shows how many, and the press after asks for just those.
 			if pending.scan then
 				results[id] = nil
-				scanBatch, scanBatchID, scanBatchAt = pending.qty * 2, id, GetTime()
+				scanBatch, scanBatchID, scanBatchAt = math.huge, id, GetTime()
+				if pending.follow and pending.origQty then
+					-- Re-read the rest of the answer that spotted them, now with what they really
+					-- cost: if more cheap ones were in it, the next press asks for just those.
+					local restQty, restTotal = pending.origQty - pending.qty, pending.origTotal - total
+					local more2 = HS.SizeFromAnswer(ladders[id], restQty, restTotal, pending.max, math.floor(total / pending.qty))
+					if more2 then
+						scanFollow = { id = id, qty = more2, t = GetTime(), origQty = restQty, origTotal = restTotal }
+					end
+				end
 			end
 			local r = results[id]
 			local more = 0
@@ -3440,8 +3554,12 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			end
 			-- Nothing left to buy: search again right away. More left: keep the line free for
 			-- your next click (the listings refresh on the slower deal pace instead).
-			if pending.scan and scanBatch and cfg and Remaining(cfg) > 0 then
-				SetStatus(("Bought %d! Keep pressing: the next check asks for %d."):format(pending.qty, math.min(scanBatch, Remaining(cfg))), 0.3, 1, 0.3)
+			if pending.scan and cfg and Remaining(cfg) > 0 then
+				if scanFollow and scanFollow.id == id then
+					SetStatus(("Bought %d! About %d more cheap ones: keep pressing."):format(pending.qty, scanFollow.qty), 0.3, 1, 0.3)
+				else
+					SetStatus(("Bought %d! Keep pressing: the next check asks for the rest of your amount."):format(pending.qty), 0.3, 1, 0.3)
+				end
 			end
 			if more == 0 and not pending.scan then priorityID = id end
 			pending = nil
@@ -3585,7 +3703,7 @@ SlashCmdList.HELPMESNIPER = function(msg)
 		if a == "on" or a == "off" then db.wheelCheck = (a == "on") end
 		if a == "on" then scanFails, scanOff = 0, false end
 		if n and n >= 1 then db.wheelQty = math.min(200, math.floor(n)) end
-		Print(("Wheel price checks (Focus) are %s, asking for %d at a time. /hsnipe wheel on, off, or a number to change."):format(db.wheelCheck == false and "off" or "on", db.wheelQty or 5))
+		Print(("Wheel price checks (Focus) are %s; the first check asks for %d. /hsnipe wheel on, off, or a number to change."):format(db.wheelCheck == false and "off" or "on", db.wheelQty or 20))
 		HS.Refresh()
 	else
 		Print("open the auction house and use the window. Commands: /hsnipe add, remove, list, start, stop, show, stats (stats reset starts the race counter over), wheel on/off")
