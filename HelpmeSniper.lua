@@ -654,6 +654,11 @@ local function ScanPress()
 	local id = focusID
 	local cfg = id and db.items[id]
 	if not cfg then return false end
+	if priorityID == id or (awaiting and awaiting.id == id and GetTime() - awaiting.t < 3) then
+		-- A search is about to show the whole batch: the next press after it buys all of it.
+		SetStatus("Looking at the listings for the rest...", 0.8, 0.8, 0.8)
+		return true
+	end
 	local max = MaxFor(cfg, id)
 	if not max then return false end
 	local r = results[id]
@@ -793,8 +798,12 @@ local function MouseOnAH()
 end
 
 local function CanSend(now)
-	-- Wheel price checks: while you keep pressing, don't queue searches in front of them.
-	if db.mode == "focus" and db.wheelCheck ~= false and not scanOff and now - lastPress < 1.0 then return false end
+	-- Wheel price checks: while you keep pressing, don't queue searches in front of them,
+	-- except the search right after a buy or a lost race (priorityID): it shows the whole
+	-- cheap batch, so your next press buys all of it. That one goes straight to the game's
+	-- queue instead of waiting for the line to be free.
+	local racing = db.mode == "focus" and db.wheelCheck ~= false and not scanOff and now - lastPress < 1.0
+	if racing and not priorityID then return false end
 	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
 	if #sendTimes >= MAX_PER_WINDOW then return false end
 	local interval = db.interval or MIN_INTERVAL
@@ -802,6 +811,7 @@ local function CanSend(now)
 	if not priorityID and Target() then interval = math.max(interval, DEAL_INTERVAL) end -- keep the line free for your press
 	if now - lastSend < interval then return false end
 	if awaiting and now - awaiting.t < 3 then return false end -- wait for the last answer (max 3s)
+	if racing then return true end
 	return LineFree(now)
 end
 
@@ -2548,7 +2558,7 @@ The button shows what a click will do:
 - ]] .. H .. [[Cheapest first:|r on a new deal, the first click buys just the cheapest listing (the one everyone races for). The next click buys the rest in one go.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
 - ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
-- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. Never more than what's left of your amount. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
+- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a hit it looks at the listings, and your next press buys the rest of the cheap batch, cheapest first, up to your amount. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
 - ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
@@ -3377,6 +3387,9 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- so your very next click can buy the rest without waiting for a new search.
 			-- (Every buy is still price-checked first, so stale info can never overspend.)
 			local id = pending.itemID
+			-- A price-check buy: listings from before you started pressing are out of date.
+			-- Forget them so the search below shows the rest of the batch fresh.
+			if pending.scan then results[id] = nil end
 			local r = results[id]
 			local more = 0
 			if cfg and r and r.under then
