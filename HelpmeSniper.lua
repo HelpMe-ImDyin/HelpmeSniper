@@ -33,6 +33,8 @@ local DEFAULTS = {
 	sound = true,
 	locked = false, -- drag the window anywhere; tick "Lock window position" in Settings to pin it
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
+	wheelCheck = true, -- Focus: a press with no deal on screen asks the game for the price directly
+	wheelQty = 5, -- how many each of those price checks asks for (a whole big amount would almost never average under the max)
 	countdown = true, -- Focus: quantity is a hard total (untick to buy up to the quantity on every click)
 	resetMinutes = 5, -- Focus count down starts over after this many minutes without buying that item
 	reserve = 5000, -- keep 50s
@@ -98,6 +100,8 @@ local keyWaiting = {} -- [itemID] = auction house item whose name the game is st
 local ui = {}
 local sellUntil, othersUntil = 0, 0 -- searching pauses until these times (you're selling / the line is in use)
 local lineFreeSince -- when the auction house line last became free (nil while it's busy)
+local lastPress = 0 -- when the buy key / wheel was last pressed (searches pause while you keep pressing)
+local scanFails, scanOff = 0, false -- wheel price checks with no price at all in a row; off for this visit
 local checkSoon = {} -- shopping list items the last full copy says may be a deal: check live first
 local function ClearCheckSoon()
 	for k in pairs(checkSoon) do checkSoon[k] = nil end
@@ -207,10 +211,10 @@ end
 
 function HS.StatsText(s, label)
 	local tries = s.tries or 0
-	if tries == 0 then return { label .. ": no purchases tried yet." } end
+	if tries == 0 and (s.scanTries or 0) == 0 then return { label .. ": no purchases tried yet." } end
 	local won = s.won or 0
 	local lines = {
-		("%s: %d tries, %d won (%d%%)."):format(label, tries, won, math.floor(won * 100 / tries + 0.5)),
+		("%s: %d tries, %d won (%d%%)."):format(label, tries, won, tries > 0 and math.floor(won * 100 / tries + 0.5) or 0),
 		("Lost: %d at the final buy (someone else's buy landed first: \"internal auction house error\"), %d price came back over your max (someone bought the cheap ones first), %d already gone, %d timed out, %d over your spending money.")
 			:format(s.lostFinal or 0, s.lostPrice or 0, s.lostGone or 0, s.timeout or 0, s.lostMoney or 0),
 	}
@@ -223,6 +227,10 @@ function HS.StatsText(s, label)
 	if (s.queued or 0) > 0 or (s.dropped or 0) > 0 then
 		lines[#lines + 1] = ("Game queue: %d requests waited in it (%s on average), %d dropped by the game.")
 			:format(s.queued or 0, avg("queue"), s.dropped or 0)
+	end
+	if (s.scanTries or 0) > 0 then
+		lines[#lines + 1] = ("Wheel price checks: %d sent, %d found your amount within your max (counted in tries above, %d won), %d over your max, %d got no price; each took %s.")
+			:format(s.scanTries, s.scanHits or 0, s.scanWon or 0, s.scanNo or 0, s.scanNone or 0, avg("scanQuote"))
 	end
 	return lines
 end
@@ -619,8 +627,70 @@ local function SendConfirm(auto)
 	C_AuctionHouse.ConfirmCommoditiesPurchase(pending.itemID, pending.qty)
 end
 
+-- ----------------------------------------------------------------------------
+-- Wheel price checks (v0.7.6). On Focus, a press with no deal on screen asks the game
+-- straight away what your amount would cost, instead of waiting for a search to spot the deal.
+-- That takes one request (the search) out of the race: every request waits about 0.4 s in the
+-- game's queue, so a race was search + price + buy. If the price averages at or under your
+-- max, it buys (the same check as every other buy); if not, nothing is bought.
+-- While you keep pressing, searches pause so they don't queue in front of your price checks.
+-- If the game gives no price several times in a row, this turns itself off for the visit.
+-- ----------------------------------------------------------------------------
+local SCAN_FAILS_MAX = 4
+
+local function ScanFailed(why)
+	Stat("scanNone")
+	scanFails = scanFails + 1
+	if scanFails >= SCAN_FAILS_MAX and not scanOff then
+		scanOff = true
+		Print(("Wheel price checks got no price %d times in a row (%s), so they're off until you reopen the auction house. Buying works as before."):format(SCAN_FAILS_MAX, why))
+	end
+end
+
+-- Sends a price check for the Focus item. Returns true if the press was used (sent, or
+-- the reason it can't be is on the status line); false to fall back to "No deals right now."
+local function ScanPress()
+	if db.mode ~= "focus" or db.wheelCheck == false or scanOff then return false end
+	local id = focusID
+	local cfg = id and db.items[id]
+	if not cfg then return false end
+	local max = MaxFor(cfg, id)
+	if not max then return false end
+	local r = results[id]
+	local cheapRef = (r and r.cheapest) or (db.market[id] and db.market[id].min)
+	if not (Typical(id) or cheapRef) then return false end -- nothing to check the max against yet
+	if TypoRef(cfg, id, max, cheapRef) then
+		SetStatus("Your max looks like a typo. Fix it or click \"I meant it\" first.", 1, 0.4, 0.4)
+		return true
+	end
+	local qty = Remaining(cfg)
+	if qty <= 0 then
+		SetStatus(("Got all %d %s. Reset the count to buy more."):format(cfg.qty, ItemName(id)), 0.3, 1, 0.3)
+		return true
+	end
+	-- A small batch: deals are usually a few cheap ones, and asking for a big amount would bring
+	-- the average over your max (cheap silk is often bought 1 to 9 at a time).
+	qty = math.min(qty, db.wheelQty or 5, math.floor(Spendable() / max))
+	if qty <= 0 then
+		SetStatus("Not enough gold above your \"never spend below\" amount.", 1, 0.4, 0.4)
+		return true
+	end
+	local now = GetTime()
+	Stat("scanTries")
+	pending = {
+		itemID = id, qty = qty, expected = max * qty, max = max, stage = "quoting", t = now, tStart = now,
+		moneyAtStart = Money_Now(), cfg = cfg, scan = true,
+	}
+	lineFreeSince = nil
+	C_AuctionHouse.StartCommoditiesPurchase(id, qty)
+	SetStatus(("Checking the price of %d %s..."):format(qty, ItemName(id)), 0.8, 0.8, 0.8)
+	HS.Refresh()
+	return true
+end
+
 function HelpmeSniper_BuyStep()
 	if not db then return end
+	lastPress = GetTime()
 	if not ahOpen then
 		Print("Open the auction house first.")
 		return
@@ -633,6 +703,7 @@ function HelpmeSniper_BuyStep()
 	end
 	local id = Target()
 	if not id then
+		if ScanPress() then return end
 		SetStatus("No deals right now.", 0.7, 0.7, 0.7)
 		return
 	end
@@ -722,6 +793,8 @@ local function MouseOnAH()
 end
 
 local function CanSend(now)
+	-- Wheel price checks: while you keep pressing, don't queue searches in front of them.
+	if db.mode == "focus" and db.wheelCheck ~= false and not scanOff and now - lastPress < 1.0 then return false end
 	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
 	if #sendTimes >= MAX_PER_WINDOW then return false end
 	local interval = db.interval or MIN_INTERVAL
@@ -813,6 +886,14 @@ local function Tick()
 			return
 		end
 		local limit = (pending.stage == "buying" and BUY_TIMEOUT) or ((pending.stage == "quoting" or pending.stage == "waitline") and QUOTE_TIMEOUT) or READY_TIMEOUT
+		if now - pending.t > limit and pending.scan and pending.stage == "quoting" then
+			CancelQuote()
+			ScanFailed("no answer")
+			SetStatus("No answer to the price check. Keep pressing.", 1, 0.6, 0.2)
+			pending = nil
+			HS.Refresh()
+			return
+		end
 		if now - pending.t > limit then
 			Stat("timeout")
 			if pending.stage ~= "buying" then CancelQuote() end
@@ -2119,6 +2200,11 @@ local function BuildSettingsPanel(p)
 	ui.soundCheck = Check(p, "Play a sound when a deal appears", 0, -150, function(self) db.sound = self:GetChecked() and true or false end)
 	ui.autoCheck = Check(p, "Start searching when the auction house opens", 0, -172, function(self) db.autoStart = self:GetChecked() and true or false end)
 	ui.lockCheck = Check(p, "Lock window position", 0, -194, function(self) db.locked = self:GetChecked() and true or false end)
+	ui.wheelCheck = Check(p, "Focus: presses check the price directly", 190, -194, function(self)
+		db.wheelCheck = self:GetChecked() and true or false
+		if db.wheelCheck then scanFails, scanOff = 0, false end
+	end)
+	Tip(ui.wheelCheck, "On Focus, pressing Buy with no deal on screen asks the game what a small\nbatch (5; /hsnipe wheel 3 for 3) costs right now and buys it if it averages\nat or under your max.\nFaster than waiting for a search. Searches pause while you keep pressing.")
 
 	local help = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	help:SetPoint("TOPLEFT", 2, -222)
@@ -2462,6 +2548,7 @@ The button shows what a click will do:
 - ]] .. H .. [[Cheapest first:|r on a new deal, the first click buys just the cheapest listing (the one everyone races for). The next click buys the rest in one go.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
 - ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
+- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. Never more than what's left of your amount. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
 - ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
@@ -2795,6 +2882,7 @@ local function RefreshSettings()
 	ui.autoCheck:SetChecked(db.autoStart)
 	ui.lockCheck:SetChecked(db.locked)
 	ui.autoBuyCheck:SetChecked(db.autoBuy)
+	if ui.wheelCheck then ui.wheelCheck:SetChecked(db.wheelCheck ~= false) end
 	ui.autoBuyNote:SetText((db.autoBuy and db.autoBuyBlocked) and "|cffff8833blocked by the game: 2 presses|r" or "")
 	ui.resetText:SetText(tostring(db.resetMinutes or 5))
 end
@@ -3068,6 +3156,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		ahOpen = true
 		results = {}
 		visit = {} -- the race counter's "this visit" starts over
+		scanFails, scanOff = 0, false
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3111,7 +3200,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "AUCTION_HOUSE_CLOSED" then
-		if (visit.tries or 0) > 0 then
+		if (visit.tries or 0) + (visit.scanTries or 0) > 0 then
 			for _, line in ipairs(HS.StatsText(visit, "This visit")) do Print(line) end
 		end
 		HS.ClosePicker()
@@ -3144,7 +3233,24 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- so the race isn't thrown away over a few coppers. Over your max: cancel and
 			-- search again right away.
 			local cap = pending.max and (pending.max * pending.qty) or pending.expected
-			Timing("quote", GetTime() - (pending.tStart or GetTime()))
+			Timing(pending.scan and "scanQuote" or "quote", GetTime() - (pending.tStart or GetTime()))
+			if pending.scan then scanFails = 0 end
+			if pending.scan and not (totalPrice <= cap and totalPrice <= Spendable()) then
+				-- A wheel price check that found nothing at your price: not a lost race, just no deal.
+				-- No cancel: the next price check replaces this one (TSM never cancels either), and a
+				-- cancel could take a turn in the game's queue ahead of your next check.
+				Stat("scanNo")
+				SetStatus(("Price check: %s each, over your max %s. Keep pressing."):format(Money(math.floor(totalPrice / pending.qty)), Money(pending.max)), 0.8, 0.8, 0.8)
+				pending = nil
+				HS.Refresh()
+				return
+			end
+			if pending.scan then
+				-- Found your amount at your price: from here it's a normal race.
+				Stat("tries")
+				Stat("scanHits")
+				PlayAlert()
+			end
 			if totalPrice <= cap and totalPrice <= Spendable() then
 				pending.quote = totalPrice
 				pending.t = GetTime()
@@ -3223,7 +3329,12 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "COMMODITY_PRICE_UNAVAILABLE" then
-		if pending then
+		if pending and pending.scan and pending.stage == "quoting" then
+			ScanFailed("price unavailable")
+			SetStatus("The game gave no price. Keep pressing.", 1, 0.6, 0.2)
+			pending = nil
+			HS.Refresh()
+		elseif pending then
 			Stat("lostGone")
 			Timing("quote", GetTime() - (pending.tStart or GetTime()))
 			SetStatus("Those auctions are gone. Nothing bought.", 1, 0.4, 0.4)
@@ -3235,6 +3346,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 	elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then
 		if pending then
 			Stat("won")
+			if pending.scan then Stat("scanWon") end
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			local total = pending.quote or pending.expected
 			table.insert(db.history, 1, { t = time(), id = pending.itemID, qty = pending.qty, total = total })
@@ -3322,6 +3434,13 @@ ev:SetScript("OnEvent", function(_, event, ...)
 					Stat("lostFinal")
 					Timing("buy", GetTime() - pending.t)
 					SetStatus("Someone else's buy landed first. Nothing bought. Searching again...", 1, 0.4, 0.4)
+				elseif pending.scan then
+					CancelQuote()
+					ScanFailed("auction house error")
+					SetStatus("No price from the game. Keep pressing.", 1, 0.6, 0.2)
+					pending = nil
+					HS.Refresh()
+					return
 				else
 					Stat("lostGone")
 					CancelQuote()
@@ -3423,12 +3542,20 @@ SlashCmdList.HELPMESNIPER = function(msg)
 			local s = db.stats or {}
 			local label = s.since and ("Since " .. date("%b %d %H:%M", s.since)) or "So far"
 			for _, line in ipairs(HS.StatsText(s, label)) do Print(line) end
-			if (visit.tries or 0) > 0 then
+			if (visit.tries or 0) + (visit.scanTries or 0) > 0 then
 				for _, line in ipairs(HS.StatsText(visit, "This visit")) do Print(line) end
 			end
 		end
+	elseif cmd == "wheel" then
+		local a = (args[2] or ""):lower()
+		local n = tonumber(a)
+		if a == "on" or a == "off" then db.wheelCheck = (a == "on") end
+		if a == "on" then scanFails, scanOff = 0, false end
+		if n and n >= 1 then db.wheelQty = math.min(200, math.floor(n)) end
+		Print(("Wheel price checks (Focus) are %s, asking for %d at a time. /hsnipe wheel on, off, or a number to change."):format(db.wheelCheck == false and "off" or "on", db.wheelQty or 5))
+		HS.Refresh()
 	else
-		Print("open the auction house and use the window. Commands: /hsnipe add, remove, list, start, stop, show, stats (stats reset starts the race counter over)")
+		Print("open the auction house and use the window. Commands: /hsnipe add, remove, list, start, stop, show, stats (stats reset starts the race counter over), wheel on/off")
 	end
 	HS.Refresh()
 end
