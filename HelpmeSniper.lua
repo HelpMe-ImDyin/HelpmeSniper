@@ -60,7 +60,8 @@ local PRICE_KEEP_SECONDS = 3 * 24 * 3600 -- price memory: last 3 days
 local MIN_SAMPLES = 10 -- scans needed before "Typical" is trusted
 -- BUY_TIMEOUT 4 (was 8): a safety net only. Lost races now end at once through the error
 -- message; if no answer comes at all, give the controls back sooner.
-local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 6, 20, 4
+-- QUOTE_TIMEOUT 3 (was 6): the price normally comes back in about 0.2 s.
+local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 3, 20, 4
 -- While a deal is on screen, search less often so the auction house line is free the
 -- instant you press buy (a search in flight can delay or swallow the price request).
 -- 1 second (was 2): a deal someone else bought disappears from your screen sooner, so fewer
@@ -219,6 +220,10 @@ function HS.StatsText(s, label)
 	end
 	lines[#lines + 1] = ("Average times: you pressed %s after a deal appeared; the deal's info was %s old when you pressed; price check took %s; waiting for the line %s; final buy took %s.")
 		:format(avg("react"), avg("age"), avg("quote"), avg("wait"), avg("buy"))
+	if (s.queued or 0) > 0 or (s.dropped or 0) > 0 then
+		lines[#lines + 1] = ("Game queue: %d requests waited in it (%s on average), %d dropped by the game.")
+			:format(s.queued or 0, avg("queue"), s.dropped or 0)
+	end
 	return lines
 end
 
@@ -621,13 +626,7 @@ function HelpmeSniper_BuyStep()
 		return
 	end
 	if pending then
-		if pending.stage == "ready" then
-			if LineReady() then
-				SendConfirm(false)
-			else
-				SetStatus("Auction house busy for a split second. Press again.", 1, 1, 0)
-			end
-		end
+		if pending.stage == "ready" then SendConfirm(false) end
 		-- Getting the price or already buying: extra presses do nothing, so spamming is safe.
 		HS.Refresh()
 		return
@@ -637,11 +636,12 @@ function HelpmeSniper_BuyStep()
 		SetStatus("No deals right now.", 0.7, 0.7, 0.7)
 		return
 	end
-	if not LineReady() then
-		-- The price request needs this exact key press, so it can't be saved for later.
-		SetStatus("Auction house busy for a split second. Press again.", 1, 1, 0)
-		return
-	end
+	-- v0.7.5: no "line busy" check here any more. The race counter showed presses being
+	-- turned away for about half a second after every search answer while the game said the
+	-- line wasn't ready, so the first accepted press came 0.66 s after a deal appeared even
+	-- with the mouse wheel spinning. The game queues a request sent while the line is busy
+	-- and sends it the moment it can (TSM and Blizzard's own buy window never check either).
+	-- If the game drops it instead, AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED frees the next press.
 	local r = results[id]
 	local cfg = Cfg(id)
 	local qty, expected = HS.NextBite(r)
@@ -3044,6 +3044,9 @@ ev:RegisterEvent("PLAYER_MONEY")
 ev:RegisterEvent("ADDON_ACTION_BLOCKED")
 ev:RegisterEvent("ADDON_ACTION_FORBIDDEN")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_SYSTEM_READY") -- not on every client; Tick checks too
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED")
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT")
+pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED") -- typed item names
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_FAILURE")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_BROWSE_RESULTS_ADDED") -- more results of your own searches
@@ -3147,12 +3150,9 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				pending.t = GetTime()
 				pending.tQuoted = pending.t
 				if db.autoBuy and not db.autoBuyBlocked then
-					if LineReady() then
-						SendConfirm(true)
-					else
-						pending.stage = "waitline" -- buys the moment the line frees up
-						pending.auto = true
-					end
+					-- v0.7.5: buy at once, even if the game says the line is busy (it queues it).
+					-- Waiting for the line here cost about half a second per race.
+					SendConfirm(true)
 				else
 					pending.stage = "ready"
 					SetStatus(("READY: press again to buy %d %s for %s"):format(pending.qty, ItemName(pending.itemID), Money(totalPrice)), 0.3, 1, 0.3)
@@ -3177,6 +3177,36 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		if pending and pending.stage == "waitline" then
 			SendConfirm(true)
 			HS.Refresh()
+		end
+
+	elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED" then
+		-- Our request waits in the game's queue for a moment (counted, to see how long).
+		if pending and (pending.stage == "quoting" or pending.stage == "buying") then
+			Stat("queued")
+			pending.tQueued = GetTime()
+		end
+
+	elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT" then
+		if pending and pending.tQueued then
+			Timing("queue", GetTime() - pending.tQueued)
+			pending.tQueued = nil
+		end
+
+	elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" then
+		-- The game threw our request away instead of queueing it. Price request: free the
+		-- next press (it needs a key press, so it can't be resent for you). Final buy: send it
+		-- again the moment the line frees up (the price you accepted still stands).
+		if pending and GetTime() - pending.t < 2 then
+			Stat("dropped")
+			pending.tQueued = nil
+			if pending.stage == "quoting" then
+				pending = nil
+				SetStatus("The game dropped that request. Keep pressing.", 1, 1, 0)
+				HS.Refresh()
+			elseif pending.stage == "buying" then
+				pending.stage = "waitline"
+				pending.t = GetTime()
+			end
 		end
 
 	elseif event == "ADDON_ACTION_BLOCKED" or event == "ADDON_ACTION_FORBIDDEN" then
