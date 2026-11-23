@@ -58,7 +58,9 @@ local MIN_INTERVAL = 0.6
 local MAX_INTERVAL = 3.0
 local PRICE_KEEP_SECONDS = 3 * 24 * 3600 -- price memory: last 3 days
 local MIN_SAMPLES = 10 -- scans needed before "Typical" is trusted
-local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 6, 20, 8
+-- BUY_TIMEOUT 4 (was 8): a safety net only. Lost races now end at once through the error
+-- message; if no answer comes at all, give the controls back sooner.
+local QUOTE_TIMEOUT, READY_TIMEOUT, BUY_TIMEOUT = 6, 20, 4
 -- While a deal is on screen, search less often so the auction house line is free the
 -- instant you press buy (a search in flight can delay or swallow the price request).
 -- 1 second (was 2): a deal someone else bought disappears from your screen sooner, so fewer
@@ -815,6 +817,8 @@ local function Tick()
 			Stat("timeout")
 			if pending.stage ~= "buying" then CancelQuote() end
 			SetStatus("Timed out, cancelled. Nothing was bought.", 1, 0.6, 0.2)
+			results[pending.itemID] = nil
+			priorityID = pending.itemID -- look again right away
 			pending = nil
 			HS.Refresh()
 		end
@@ -3035,6 +3039,7 @@ ev:RegisterEvent("COMMODITY_PRICE_UPDATED")
 ev:RegisterEvent("COMMODITY_PRICE_UNAVAILABLE")
 ev:RegisterEvent("COMMODITY_PURCHASE_SUCCEEDED")
 ev:RegisterEvent("COMMODITY_PURCHASE_FAILED")
+ev:RegisterEvent("UI_ERROR_MESSAGE") -- lost races can arrive only as an error message
 ev:RegisterEvent("PLAYER_MONEY")
 ev:RegisterEvent("ADDON_ACTION_BLOCKED")
 ev:RegisterEvent("ADDON_ACTION_FORBIDDEN")
@@ -3270,6 +3275,33 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			if more == 0 then priorityID = id end
 			pending = nil
 			HS.Refresh()
+		end
+
+	elseif event == "UI_ERROR_MESSAGE" then
+		-- The game can report a lost race ("Internal auction house error") only as an on-screen
+		-- error, without COMMODITY_PURCHASE_FAILED. Without this, the addon kept waiting for an
+		-- answer (up to BUY_TIMEOUT), ignoring presses and not searching. TSM listens for the same
+		-- errors. Retail and Forever pass (errorType, message); older clients pass (message).
+		if pending and (pending.stage == "buying" or pending.stage == "quoting") then
+			local a, b = ...
+			local msg = (type(b) == "string" and b) or (type(a) == "string" and a) or nil
+			local lost = msg and (msg == _G.ERR_AUCTION_DATABASE_ERROR or msg == _G.ERR_ITEM_NOT_FOUND
+				or msg == _G.ERR_AUCTION_HIGHER_BID or msg == _G.ERR_NOT_ENOUGH_MONEY or msg == _G.ERR_AUCTION_BID_OWN)
+			if lost then
+				if pending.stage == "buying" then
+					Stat("lostFinal")
+					Timing("buy", GetTime() - pending.t)
+					SetStatus("Someone else's buy landed first. Nothing bought. Searching again...", 1, 0.4, 0.4)
+				else
+					Stat("lostGone")
+					CancelQuote()
+					SetStatus("Those auctions are gone. Nothing bought. Searching again...", 1, 0.4, 0.4)
+				end
+				results[pending.itemID] = nil
+				priorityID = pending.itemID -- look again right away
+				pending = nil
+				HS.Refresh()
+			end
 		end
 
 	elseif event == "COMMODITY_PURCHASE_FAILED" then
