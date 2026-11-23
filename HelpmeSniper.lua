@@ -109,6 +109,25 @@ local scanFails, scanOff = 0, false -- wheel price checks with no price at all i
 -- cheap and too big to spot a normal cheap batch inside.)
 local AFTER_BUY_ASK = 100
 local RACE_SEARCH_EVERY = 2.0 -- while you keep pressing, one search gets through this often (seconds)
+-- Requests per minute (v0.7.11): every request counts (search, price, buy, cancel), not just
+-- searches. Near the limit, searches stop first; price checks and buys stop at the limit.
+local REQUEST_BUDGET, SEARCH_BUDGET = 98, 85
+local DROP_WAIT = 0.8 -- after the game drops a request: wait this long for a late price answer
+local MIN_SPOT = 3 -- follow up on "cheap ones spotted" only from this many (1-2 were mostly false)
+local quietUntil = 0 -- presses send nothing until then (an old price answer may still arrive)
+local lastRequestAt = 0
+local staleRun, staleGuardOff = 0, false -- price answers that didn't match the request in a row
+local paidCheck -- { e = history entry, start = gold before, quote, t }: what a buy really cost
+
+local function RequestsInWindow(now)
+	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
+	return #sendTimes
+end
+
+local function CountRequest(now)
+	sendTimes[#sendTimes + 1] = now
+	lastRequestAt = now
+end
 local scanBatch, scanBatchID, scanBatchAt
 -- Listings above your max from the last search, cheapest first: what a price check costs
 -- when there's nothing cheap in it. [itemID] = { t, max, units, rows = { {price, qty}... } }
@@ -240,8 +259,8 @@ function HS.StatsText(s, label)
 	lines[#lines + 1] = ("Average times: you pressed %s after a deal appeared; the deal's info was %s old when you pressed; price check took %s; waiting for the line %s; final buy took %s.")
 		:format(avg("react"), avg("age"), avg("quote"), avg("wait"), avg("buy"))
 	if (s.queued or 0) > 0 or (s.dropped or 0) > 0 then
-		lines[#lines + 1] = ("Game queue: %d requests waited in it (%s on average), %d dropped by the game.")
-			:format(s.queued or 0, avg("queue"), s.dropped or 0)
+		lines[#lines + 1] = ("Game queue: %d requests waited in it (%s on average), %d dropped by the game, %d late price answers ignored, %d buys cost less than quoted.")
+			:format(s.queued or 0, avg("queue"), s.dropped or 0, s.staleAnswer or 0, s.paidLess or 0)
 	end
 	if (s.scanTries or 0) > 0 then
 		lines[#lines + 1] = ("Wheel price checks: %d sent, %d found your amount within your max (counted in tries above, %d won), %d over your max, %d got no price; each took %s.")
@@ -254,8 +273,11 @@ function HS.StatsText(s, label)
 	return lines
 end
 
+-- Only when the auction house closes (v0.7.11). A new price request replaces the old one
+-- anyway (TSM never cancels), and a cancel takes a turn in the game's queue.
 local function CancelQuote()
 	if C_AuctionHouse and C_AuctionHouse.CancelCommoditiesPurchase then
+		CountRequest(GetTime())
 		pcall(C_AuctionHouse.CancelCommoditiesPurchase)
 	end
 end
@@ -654,6 +676,7 @@ local function SendConfirm(auto)
 	pending.t = GetTime()
 	SetStatus(("Buying %d %s for %s..."):format(pending.qty, ItemName(pending.itemID), Money(pending.quote)), 1, 1, 0)
 	lineFreeSince = nil
+	CountRequest(pending.t)
 	C_AuctionHouse.ConfirmCommoditiesPurchase(pending.itemID, pending.qty)
 end
 
@@ -668,6 +691,20 @@ end
 -- ----------------------------------------------------------------------------
 local SCAN_FAILS_MAX = 4
 
+function HS.CheckPaid()
+	local c = paidCheck
+	if not c then return end
+	if not c.start or GetTime() - c.t > 3 then paidCheck = nil return end
+	local paid = c.start - GetMoney()
+	if paid <= 0 then return end -- the game hasn't taken the gold yet
+	paidCheck = nil
+	if paid < c.quote then
+		c.e.quote, c.e.total = c.quote, paid
+		Stat("paidLess")
+		Print(("Paid %s, %s less than quoted."):format(Money(paid), Money(c.quote - paid)))
+	end
+end
+
 -- Race log (v0.7.10): how each price request ended, newest first, the last 400. Saved with
 -- your settings so the sizes that win can be measured, not guessed.
 -- Each entry: { time, game clock, kind, how many, result, average price asked or paid }.
@@ -675,11 +712,11 @@ local SCAN_FAILS_MAX = 4
 -- answer), search (a deal a search found). result: won, lost (someone else's buy landed
 -- first), over (over your max), spotN (over, but N cheap ones spotted: the next ask), miss
 -- (a sized ask that came back over), noprice, noanswer, dropped, gone.
-local function RaceLog(result, avg)
+local function RaceLog(result, avg, extra)
 	if not pending then return end
 	db.raceLog = db.raceLog or {}
 	local kind = (not pending.scan and "search") or (pending.follow and "follow") or (pending.after and "after") or "first"
-	table.insert(db.raceLog, 1, { time(), math.floor(GetTime() * 100) / 100, kind, pending.qty, result, avg })
+	table.insert(db.raceLog, 1, { time(), math.floor(GetTime() * 100) / 100, kind, pending.qty, result, avg, extra })
 	while #db.raceLog > 400 do table.remove(db.raceLog) end
 end
 
@@ -725,7 +762,9 @@ function HS.SizeFromAnswer(lad, qty, total, max, guess)
 	if not lad or lad.max ~= max or qty < 2 then return nil end
 	local normal = HS.LadderCost(lad, qty)
 	if not normal then return nil end
-	if total >= normal - math.max(qty, math.floor(normal * 0.005)) then return nil end
+	-- v0.7.11: also at least twice the gap between your max and the cheapest normal listing,
+	-- so one listing undercutting the normal ones by a few coppers doesn't count.
+	if total >= normal - math.max(qty, math.floor(normal * 0.005), 2 * (lad.rows[1].price - max)) then return nil end
 	local step = lad.rows[1].price - guess -- how much cheaper each cheap one is than normal
 	if step <= 0 then return nil end
 	local slack = math.floor(step / 2) -- round to the nearest count, not up
@@ -752,7 +791,7 @@ local function ScanPress()
 	local id = focusID
 	local cfg = id and db.items[id]
 	if not cfg then return false end
-	if priorityID == id or (awaiting and awaiting.id == id and GetTime() - awaiting.t < 3) then
+	if priorityID == id or (awaiting and awaiting.id == id and GetTime() - awaiting.t < 1.2) then
 		-- A search is about to show the whole batch: the next press after it buys all of it.
 		SetStatus("Refreshing the listings...", 0.8, 0.8, 0.8)
 		return true
@@ -761,9 +800,10 @@ local function ScanPress()
 	-- press. While you spam, the next price check goes out the moment the last one answers,
 	-- so the regular search timer almost never finds a gap (v0.7.9: "updated" kept counting
 	-- up the whole time you pressed).
+	-- Not when a sized follow-up is lined up: it goes first.
 	local nowP = GetTime()
-	while sendTimes[1] and nowP - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
-	if nowP - lastSend >= RACE_SEARCH_EVERY and #sendTimes < MAX_PER_WINDOW then
+	local followReady = scanFollow and scanFollow.id == id and nowP - scanFollow.t < 3
+	if not followReady and nowP - lastSend >= RACE_SEARCH_EVERY and RequestsInWindow(nowP) < SEARCH_BUDGET then
 		HS.SendSearch(id, nowP)
 		SetStatus("Refreshing the listings...", 0.8, 0.8, 0.8)
 		return true
@@ -803,14 +843,19 @@ local function ScanPress()
 		return true
 	end
 	local now = GetTime()
+	if RequestsInWindow(now) >= REQUEST_BUDGET then
+		SetStatus("At the game's request limit for a moment. Keep pressing.", 1, 1, 0)
+		return true
+	end
 	Stat("scanTries")
 	pending = {
 		itemID = id, qty = qty, expected = max * qty, max = max, stage = "quoting", t = now, tStart = now,
 		moneyAtStart = Money_Now(), cfg = cfg, scan = true, follow = follow and true or nil,
 		origQty = sf and sf.origQty, origTotal = sf and sf.origTotal,
-		after = (not follow and scanBatch) and true or nil,
+		after = (not follow and scanBatch) and true or nil, gold = GetMoney(),
 	}
 	lineFreeSince = nil
+	CountRequest(now)
 	C_AuctionHouse.StartCommoditiesPurchase(id, qty)
 	SetStatus(("Checking the price of %d %s..."):format(qty, ItemName(id)), 0.8, 0.8, 0.8)
 	HS.Refresh()
@@ -830,6 +875,11 @@ function HelpmeSniper_BuyStep()
 		HS.Refresh()
 		return
 	end
+	if GetTime() < quietUntil then
+		-- An old price request may still answer: don't send a new one it could be mistaken for.
+		SetStatus("Waiting for the game...", 1, 1, 0)
+		return
+	end
 	local id = Target()
 	if not id then
 		if ScanPress() then return end
@@ -846,6 +896,10 @@ function HelpmeSniper_BuyStep()
 	local cfg = Cfg(id)
 	local qty, expected = HS.NextBite(r)
 	local now = GetTime()
+	if RequestsInWindow(now) >= REQUEST_BUDGET then
+		SetStatus("At the game's request limit for a moment. Keep pressing.", 1, 1, 0)
+		return
+	end
 	Stat("tries")
 	if not r.firstTaken and r.dealAt then Timing("react", now - r.dealAt) end
 	Timing("age", now - (r.time or now))
@@ -853,8 +907,10 @@ function HelpmeSniper_BuyStep()
 	pending = {
 		itemID = id, qty = qty, expected = expected, max = r.max, stage = "quoting", t = now, tStart = now, moneyAtStart = Money_Now(),
 		cfg = cfg, list = (cfg and cfg.kind == "list") and ActiveList() or nil, -- where to count the purchase
+		gold = GetMoney(),
 	}
 	lineFreeSince = nil
+	CountRequest(now)
 	C_AuctionHouse.StartCommoditiesPurchase(id, qty)
 	SetStatus(("Getting price for %d %s..."):format(qty, ItemName(id)), 1, 1, 0)
 	HS.Refresh()
@@ -931,8 +987,7 @@ local function CanSend(now)
 	-- check or a buy is out: nothing is searched then.)
 	local racing = db.mode == "focus" and db.wheelCheck ~= false and not scanOff and now - lastPress < 1.0
 	if racing and not priorityID and now - lastSend < RACE_SEARCH_EVERY then return false end
-	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
-	if #sendTimes >= MAX_PER_WINDOW then return false end
+	if RequestsInWindow(now) >= SEARCH_BUDGET then return false end -- leave room for price checks and buys
 	local interval = db.interval or MIN_INTERVAL
 	if not priorityID and ui.mouseOnAH then interval = math.max(interval, HOVER_INTERVAL) end -- leave the auction house room
 	if not priorityID and Target() then interval = math.max(interval, DEAL_INTERVAL) end -- keep the line free for your press
@@ -1017,6 +1072,12 @@ local function Tick()
 		end
 	end
 	if pending then
+		if pending.stage == "quoting" and pending.dropped and now - pending.dropped > DROP_WAIT then
+			-- No answer after a drop: it was our request that was dropped. Free the next press.
+			pending = nil
+			HS.Refresh()
+			return
+		end
 		if pending.stage == "waitline" and LineReady() then
 			SendConfirm(true) -- the line just freed up: buy now
 			HS.Refresh()
@@ -1025,7 +1086,7 @@ local function Tick()
 		local limit = (pending.stage == "buying" and BUY_TIMEOUT) or ((pending.stage == "quoting" or pending.stage == "waitline") and QUOTE_TIMEOUT) or READY_TIMEOUT
 		if now - pending.t > limit and pending.scan and pending.stage == "quoting" then
 			RaceLog("noanswer")
-			CancelQuote()
+			quietUntil = now + 1.0 -- a very late answer mustn't be taken for the next request's
 			ScanFailed("no answer")
 			SetStatus("No answer to the price check. Keep pressing.", 1, 0.6, 0.2)
 			pending = nil
@@ -1034,8 +1095,8 @@ local function Tick()
 		end
 		if now - pending.t > limit then
 			Stat("timeout")
-			if pending.stage ~= "buying" then CancelQuote() end
-			SetStatus("Timed out, cancelled. Nothing was bought.", 1, 0.6, 0.2)
+			if pending.stage == "quoting" then quietUntil = now + 1.0 end
+			SetStatus("Timed out. Nothing was bought.", 1, 0.6, 0.2)
 			results[pending.itemID] = nil
 			priorityID = pending.itemID -- look again right away
 			pending = nil
@@ -1056,7 +1117,7 @@ end
 function HS.SendSearch(id, now)
 	lastSend = now
 	lineFreeSince = nil
-	sendTimes[#sendTimes + 1] = now
+	CountRequest(now)
 	awaiting = { id = id, t = now }
 	C_AuctionHouse.SendSearchQuery(C_AuctionHouse.MakeItemKey(id), {}, true)
 end
@@ -1902,7 +1963,7 @@ function HS.SendNameSearch()
 	s.sent = now
 	lineFreeSince = nil
 	lastSend = now -- the regular searching waits its turn
-	sendTimes[#sendTimes + 1] = now
+	CountRequest(now)
 	C_AuctionHouse.SendBrowseQuery({ searchString = s.text, sorts = sorts, filters = {}, itemClassFilters = {} })
 end
 
@@ -3308,6 +3369,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		visit = {} -- the race counter's "this visit" starts over
 		scanFails, scanOff = 0, false
 		scanBatch, scanFollow = nil, nil
+		staleRun, staleGuardOff, quietUntil = 0, false, 0
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3376,8 +3438,27 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		if Cfg(itemID) and not pending then Evaluate(itemID) end
 
 	elseif event == "COMMODITY_PRICE_UPDATED" then
-		local _, totalPrice = ...
+		local unitPrice, totalPrice = ...
 		if pending and pending.stage == "quoting" then
+			-- v0.7.11: make sure this answer is for the request we're waiting on. A late answer
+			-- to an earlier request (after a drop or a timeout) could otherwise approve a buy of
+			-- a different amount that was never checked against your max. The answer's
+			-- quantity is its total divided by its price each.
+			if not staleGuardOff and unitPrice and unitPrice > 0 and totalPrice then
+				if math.abs(totalPrice / unitPrice - pending.qty) > 0.5 + pending.qty / unitPrice then
+					Stat("staleAnswer")
+					staleRun = staleRun + 1
+					if staleRun >= 4 then
+						-- Four in a row means the game's answers don't carry what this expects:
+						-- say so instead of silently ignoring every price.
+						staleGuardOff = true
+						Print("Price answers don't match the requested amounts the way Helpme Sniper expects, so that check is off until you reopen the auction house. Please tell the author.")
+					end
+					return
+				end
+			end
+			staleRun = 0
+			pending.unit = unitPrice
 			-- Accept if the average price stays at or under your max and you can afford it.
 			-- If someone bought part of the cheap ones first, the price is usually a bit
 			-- higher than shown; that's still a win as long as the average is within your max,
@@ -3394,6 +3475,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				local id = pending.itemID
 				scanBatch = nil -- back to the starting size
 				local L = not pending.follow and HS.SizeFromAnswer(ladders[id], pending.qty, totalPrice, pending.max, HS.DealPriceGuess(db.history, id, pending.max))
+				if L and L < MIN_SPOT then L = nil end
 				if pending.follow then
 					-- Fewer cheap ones than worked out (someone got some, or the listings above
 					-- your max changed): look at the listings again, which refreshes both.
@@ -3435,7 +3517,6 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				end
 			else
 				RaceLog("over", math.floor(totalPrice / pending.qty))
-				CancelQuote()
 				Stat(totalPrice > Spendable() and totalPrice <= cap and "lostMoney" or "lostPrice")
 				if totalPrice > Spendable() then
 					SetStatus(("Price came back at %s, more than you can spend. Cancelled, nothing bought."):format(Money(totalPrice)), 1, 0.4, 0.4)
@@ -3470,17 +3551,23 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" then
-		-- The game threw our request away instead of queueing it. Price request: free the
-		-- next press (it needs a key press, so it can't be resent for you). Final buy: send it
-		-- again the moment the line frees up (the price you accepted still stands).
+		-- The game threw a request away instead of queueing it. Price request: wait briefly
+		-- for a late answer, then free the next press (a price request needs a key press, so
+		-- it can't be resent for you). Final buy: send it again the moment the line frees up
+		-- (the price you accepted still stands).
 		if pending and GetTime() - pending.t < 2 then
 			Stat("dropped")
-			RaceLog(pending.stage == "buying" and "dropbuy" or "dropped", pending.avg)
+			local nowD = GetTime()
+			RaceLog(pending.stage == "buying" and "dropbuy" or "dropped", pending.avg,
+				("%d/min %dms"):format(RequestsInWindow(nowD), math.floor((nowD - lastRequestAt) * 1000)))
 			pending.tQueued = nil
 			if pending.stage == "quoting" then
-				pending = nil
-				SetStatus("The game dropped that request. Keep pressing.", 1, 1, 0)
-				HS.Refresh()
+				-- v0.7.11: don't free the press at once. The drop may have been another request,
+				-- with our answer still on its way; and firing again straight away met the same
+				-- full queue (drops came in bursts of 6 within 0.2 s). Tick frees it after
+				-- DROP_WAIT if no answer comes.
+				pending.dropped = pending.dropped or nowD
+				SetStatus("The game dropped a request. One moment...", 1, 1, 0)
 			elseif pending.stage == "buying" then
 				pending.stage = "waitline"
 				pending.t = GetTime()
@@ -3518,14 +3605,20 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then
-		if pending then
+		-- Only for a buy that was actually sent (v0.7.11): a late message must not end the next check.
+		if pending and (pending.stage == "buying" or pending.stage == "waitline") then
 			Stat("won")
 			RaceLog("won", pending.avg)
 			if pending.scan then Stat("scanWon") end
 			if pending.follow then Stat("scanFollowWon") end
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			local total = pending.quote or pending.expected
-			table.insert(db.history, 1, { t = time(), id = pending.itemID, qty = pending.qty, total = total })
+			local entry = { t = time(), id = pending.itemID, qty = pending.qty, total = total }
+			table.insert(db.history, 1, entry)
+			-- What it really cost: the game may charge less than quoted (TSM recorded two buys
+			-- well under their quotes). Worked out from your gold, now or at the next change.
+			paidCheck = { e = entry, start = pending.gold, quote = total, t = GetTime() }
+			HS.CheckPaid()
 			while #db.history > 50 do table.remove(db.history) end
 			Print(("Bought %d %s for %s."):format(pending.qty, ItemName(pending.itemID), Money(total)))
 			local cfg = pending.cfg
@@ -3637,7 +3730,6 @@ ev:SetScript("OnEvent", function(_, event, ...)
 					SetStatus("Someone else's buy landed first. Nothing bought. Searching again...", 1, 0.4, 0.4)
 				elseif pending.scan then
 					RaceLog("noprice")
-					CancelQuote()
 					ScanFailed("auction house error")
 					SetStatus("No price from the game. Keep pressing.", 1, 0.6, 0.2)
 					pending = nil
@@ -3646,7 +3738,6 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				else
 					Stat("lostGone")
 					RaceLog("gone")
-					CancelQuote()
 					SetStatus("Those auctions are gone. Nothing bought. Searching again...", 1, 0.4, 0.4)
 				end
 				results[pending.itemID] = nil
@@ -3661,7 +3752,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "COMMODITY_PURCHASE_FAILED" then
-		if pending then
+		if pending and (pending.stage == "buying" or pending.stage == "waitline") then
 			Stat("lostFinal")
 			RaceLog("lost", pending.avg)
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
@@ -3673,6 +3764,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		end
 
 	elseif event == "PLAYER_MONEY" then
+		HS.CheckPaid()
 		HS.Refresh()
 	end
 end)
