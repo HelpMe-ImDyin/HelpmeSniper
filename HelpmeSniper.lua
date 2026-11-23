@@ -103,32 +103,33 @@ local lineFreeSince -- when the auction house line last became free (nil while i
 local lastPress = 0 -- when the buy key / wheel was last pressed (searches pause while you keep pressing)
 local scanFails, scanOff = 0, false -- wheel price checks with no price at all in a row; off for this visit
 -- Price check sizes (v0.7.10): the first check asks for 20 (db.wheelQty). After a price-check
--- buy, the next asks for up to AFTER_BUY_ASK (scanBatch). Back to 20 after a check with
+-- buy, the next asks for up to AFTER_BUY_ASK (Q.scanBatch). Back to 20 after a check with
 -- nothing cheap in it, a lost race, a different item, or 10 seconds without a buy.
 -- (v0.7.9 asked for the rest of your amount: with 1000 set, about 880, which was never all
 -- cheap and too big to spot a normal cheap batch inside.)
 local AFTER_BUY_ASK = 100
 local RACE_SEARCH_EVERY = 2.0 -- while you keep pressing, one search gets through this often (seconds)
+-- Small state kept in one table (v0.7.11 fix): WoW's Lua lets a function use at most 60
+-- outside variables, and the event handler hit that limit, so the add-on failed to load.
+local Q = { MIN_SPOT = 3, quietUntil = 0, lastRequestAt = 0, staleRun = 0, staleGuardOff = false }
 -- Requests per minute (v0.7.11): every request counts (search, price, buy, cancel), not just
 -- searches. Near the limit, searches stop first; price checks and buys stop at the limit.
 local REQUEST_BUDGET, SEARCH_BUDGET = 98, 85
 local DROP_WAIT = 0.8 -- after the game drops a request: wait this long for a late price answer
-local MIN_SPOT = 3 -- follow up on "cheap ones spotted" only from this many (1-2 were mostly false)
-local quietUntil = 0 -- presses send nothing until then (an old price answer may still arrive)
-local lastRequestAt = 0
-local staleRun, staleGuardOff = 0, false -- price answers that didn't match the request in a row
-local paidCheck -- { e = history entry, start = gold before, quote, t }: what a buy really cost
+-- Q.MIN_SPOT: follow up on "cheap ones spotted" only from this many (1-2 were mostly false).
+-- Q.quietUntil: presses send nothing until then (an old price answer may still arrive).
+-- Q.staleRun, Q.staleGuardOff: price answers that didn't match the request in a row.
+-- Q.paidCheck = { e = history entry, start = gold before, quote, t }: what a buy really cost.
 
-local function RequestsInWindow(now)
+function HS.RequestsInWindow(now)
 	while sendTimes[1] and now - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
 	return #sendTimes
 end
 
 local function CountRequest(now)
 	sendTimes[#sendTimes + 1] = now
-	lastRequestAt = now
+	Q.lastRequestAt = now
 end
-local scanBatch, scanBatchID, scanBatchAt
 -- Listings above your max from the last search, cheapest first: what a price check costs
 -- when there's nothing cheap in it. [itemID] = { t, max, units, rows = { {price, qty}... } }
 local ladders = {}
@@ -692,12 +693,12 @@ end
 local SCAN_FAILS_MAX = 4
 
 function HS.CheckPaid()
-	local c = paidCheck
+	local c = Q.paidCheck
 	if not c then return end
-	if not c.start or GetTime() - c.t > 3 then paidCheck = nil return end
+	if not c.start or GetTime() - c.t > 3 then Q.paidCheck = nil return end
 	local paid = c.start - GetMoney()
 	if paid <= 0 then return end -- the game hasn't taken the gold yet
-	paidCheck = nil
+	Q.paidCheck = nil
 	if paid < c.quote then
 		c.e.quote, c.e.total = c.quote, paid
 		Stat("paidLess")
@@ -803,7 +804,7 @@ local function ScanPress()
 	-- Not when a sized follow-up is lined up: it goes first.
 	local nowP = GetTime()
 	local followReady = scanFollow and scanFollow.id == id and nowP - scanFollow.t < 3
-	if not followReady and nowP - lastSend >= RACE_SEARCH_EVERY and RequestsInWindow(nowP) < SEARCH_BUDGET then
+	if not followReady and nowP - lastSend >= RACE_SEARCH_EVERY and HS.RequestsInWindow(nowP) < SEARCH_BUDGET then
 		HS.SendSearch(id, nowP)
 		SetStatus("Refreshing the listings...", 0.8, 0.8, 0.8)
 		return true
@@ -823,15 +824,15 @@ local function ScanPress()
 		return true
 	end
 	-- How many to ask for: the number the last answer showed (scanFollow), else the rest of
-	-- your amount right after a buy (scanBatch), else 20 (db.wheelQty). A batch of 20 or more
+	-- your amount right after a buy (Q.scanBatch), else 20 (db.wheelQty). A batch of 20 or more
 	-- is bought in one go; a smaller one shows up as a cheaper-than-normal answer, and the
 	-- next press asks for just that many.
-	if scanBatchID ~= id or GetTime() - (scanBatchAt or 0) > 10 then scanBatch = nil end
+	if Q.scanBatchID ~= id or GetTime() - (Q.scanBatchAt or 0) > 10 then Q.scanBatch = nil end
 	local sf = scanFollow and scanFollow.id == id and GetTime() - scanFollow.t < 3 and scanFollow or nil
 	local follow = sf and sf.qty
 	scanFollow = nil
-	local want = follow or scanBatch or db.wheelQty or 20
-	if not follow and scanBatch then
+	local want = follow or Q.scanBatch or db.wheelQty or 20
+	if not follow and Q.scanBatch then
 		-- No more than the normal-cost list covers (so a cheaper-than-normal answer can still
 		-- be worked out).
 		local lad = ladders[id]
@@ -843,7 +844,7 @@ local function ScanPress()
 		return true
 	end
 	local now = GetTime()
-	if RequestsInWindow(now) >= REQUEST_BUDGET then
+	if HS.RequestsInWindow(now) >= REQUEST_BUDGET then
 		SetStatus("At the game's request limit for a moment. Keep pressing.", 1, 1, 0)
 		return true
 	end
@@ -852,7 +853,7 @@ local function ScanPress()
 		itemID = id, qty = qty, expected = max * qty, max = max, stage = "quoting", t = now, tStart = now,
 		moneyAtStart = Money_Now(), cfg = cfg, scan = true, follow = follow and true or nil,
 		origQty = sf and sf.origQty, origTotal = sf and sf.origTotal,
-		after = (not follow and scanBatch) and true or nil, gold = GetMoney(),
+		after = (not follow and Q.scanBatch) and true or nil, gold = GetMoney(),
 	}
 	lineFreeSince = nil
 	CountRequest(now)
@@ -875,7 +876,7 @@ function HelpmeSniper_BuyStep()
 		HS.Refresh()
 		return
 	end
-	if GetTime() < quietUntil then
+	if GetTime() < Q.quietUntil then
 		-- An old price request may still answer: don't send a new one it could be mistaken for.
 		SetStatus("Waiting for the game...", 1, 1, 0)
 		return
@@ -896,7 +897,7 @@ function HelpmeSniper_BuyStep()
 	local cfg = Cfg(id)
 	local qty, expected = HS.NextBite(r)
 	local now = GetTime()
-	if RequestsInWindow(now) >= REQUEST_BUDGET then
+	if HS.RequestsInWindow(now) >= REQUEST_BUDGET then
 		SetStatus("At the game's request limit for a moment. Keep pressing.", 1, 1, 0)
 		return
 	end
@@ -987,7 +988,7 @@ local function CanSend(now)
 	-- check or a buy is out: nothing is searched then.)
 	local racing = db.mode == "focus" and db.wheelCheck ~= false and not scanOff and now - lastPress < 1.0
 	if racing and not priorityID and now - lastSend < RACE_SEARCH_EVERY then return false end
-	if RequestsInWindow(now) >= SEARCH_BUDGET then return false end -- leave room for price checks and buys
+	if HS.RequestsInWindow(now) >= SEARCH_BUDGET then return false end -- leave room for price checks and buys
 	local interval = db.interval or MIN_INTERVAL
 	if not priorityID and ui.mouseOnAH then interval = math.max(interval, HOVER_INTERVAL) end -- leave the auction house room
 	if not priorityID and Target() then interval = math.max(interval, DEAL_INTERVAL) end -- keep the line free for your press
@@ -1086,7 +1087,7 @@ local function Tick()
 		local limit = (pending.stage == "buying" and BUY_TIMEOUT) or ((pending.stage == "quoting" or pending.stage == "waitline") and QUOTE_TIMEOUT) or READY_TIMEOUT
 		if now - pending.t > limit and pending.scan and pending.stage == "quoting" then
 			RaceLog("noanswer")
-			quietUntil = now + 1.0 -- a very late answer mustn't be taken for the next request's
+			Q.quietUntil = now + 1.0 -- a very late answer mustn't be taken for the next request's
 			ScanFailed("no answer")
 			SetStatus("No answer to the price check. Keep pressing.", 1, 0.6, 0.2)
 			pending = nil
@@ -1095,7 +1096,7 @@ local function Tick()
 		end
 		if now - pending.t > limit then
 			Stat("timeout")
-			if pending.stage == "quoting" then quietUntil = now + 1.0 end
+			if pending.stage == "quoting" then Q.quietUntil = now + 1.0 end
 			SetStatus("Timed out. Nothing was bought.", 1, 0.6, 0.2)
 			results[pending.itemID] = nil
 			priorityID = pending.itemID -- look again right away
@@ -3368,8 +3369,8 @@ ev:SetScript("OnEvent", function(_, event, ...)
 		results = {}
 		visit = {} -- the race counter's "this visit" starts over
 		scanFails, scanOff = 0, false
-		scanBatch, scanFollow = nil, nil
-		staleRun, staleGuardOff, quietUntil = 0, false, 0
+		Q.scanBatch, scanFollow = nil, nil
+		Q.staleRun, Q.staleGuardOff, Q.quietUntil = 0, false, 0
 		HS.PlaceWindow()
 		ui.frame:Show()
 		scanning = db.autoStart and true or false
@@ -3444,20 +3445,20 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- to an earlier request (after a drop or a timeout) could otherwise approve a buy of
 			-- a different amount that was never checked against your max. The answer's
 			-- quantity is its total divided by its price each.
-			if not staleGuardOff and unitPrice and unitPrice > 0 and totalPrice then
+			if not Q.staleGuardOff and unitPrice and unitPrice > 0 and totalPrice then
 				if math.abs(totalPrice / unitPrice - pending.qty) > 0.5 + pending.qty / unitPrice then
 					Stat("staleAnswer")
-					staleRun = staleRun + 1
-					if staleRun >= 4 then
+					Q.staleRun = Q.staleRun + 1
+					if Q.staleRun >= 4 then
 						-- Four in a row means the game's answers don't carry what this expects:
 						-- say so instead of silently ignoring every price.
-						staleGuardOff = true
+						Q.staleGuardOff = true
 						Print("Price answers don't match the requested amounts the way Helpme Sniper expects, so that check is off until you reopen the auction house. Please tell the author.")
 					end
 					return
 				end
 			end
-			staleRun = 0
+			Q.staleRun = 0
 			pending.unit = unitPrice
 			-- Accept if the average price stays at or under your max and you can afford it.
 			-- If someone bought part of the cheap ones first, the price is usually a bit
@@ -3473,9 +3474,9 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				-- cancel could take a turn in the game's queue ahead of your next check.
 				Stat("scanNo")
 				local id = pending.itemID
-				scanBatch = nil -- back to the starting size
+				Q.scanBatch = nil -- back to the starting size
 				local L = not pending.follow and HS.SizeFromAnswer(ladders[id], pending.qty, totalPrice, pending.max, HS.DealPriceGuess(db.history, id, pending.max))
-				if L and L < MIN_SPOT then L = nil end
+				if L and L < Q.MIN_SPOT then L = nil end
 				if pending.follow then
 					-- Fewer cheap ones than worked out (someone got some, or the listings above
 					-- your max changed): look at the listings again, which refreshes both.
@@ -3559,7 +3560,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			Stat("dropped")
 			local nowD = GetTime()
 			RaceLog(pending.stage == "buying" and "dropbuy" or "dropped", pending.avg,
-				("%d/min %dms"):format(RequestsInWindow(nowD), math.floor((nowD - lastRequestAt) * 1000)))
+				("%d/min %dms"):format(HS.RequestsInWindow(nowD), math.floor((nowD - Q.lastRequestAt) * 1000)))
 			pending.tQueued = nil
 			if pending.stage == "quoting" then
 				-- v0.7.11: don't free the press at once. The drop may have been another request,
@@ -3617,7 +3618,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			table.insert(db.history, 1, entry)
 			-- What it really cost: the game may charge less than quoted (TSM recorded two buys
 			-- well under their quotes). Worked out from your gold, now or at the next change.
-			paidCheck = { e = entry, start = pending.gold, quote = total, t = GetTime() }
+			Q.paidCheck = { e = entry, start = pending.gold, quote = total, t = GetTime() }
 			HS.CheckPaid()
 			while #db.history > 50 do table.remove(db.history) end
 			Print(("Bought %d %s for %s."):format(pending.qty, ItemName(pending.itemID), Money(total)))
@@ -3652,7 +3653,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			-- cheap, that answer shows how many, and the press after asks for just those.
 			if pending.scan then
 				results[id] = nil
-				scanBatch, scanBatchID, scanBatchAt = AFTER_BUY_ASK, id, GetTime()
+				Q.scanBatch, Q.scanBatchID, Q.scanBatchAt = AFTER_BUY_ASK, id, GetTime()
 				if pending.follow and pending.origQty then
 					-- Re-read the rest of the answer that spotted them, now with what they really
 					-- cost: if more cheap ones were in it, the next press asks for just those.
@@ -3742,7 +3743,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 				end
 				results[pending.itemID] = nil
 				if pending.scan then
-					scanBatch = nil -- someone else got it: start small again, keep checking
+					Q.scanBatch = nil -- someone else got it: start small again, keep checking
 				else
 					priorityID = pending.itemID -- look again right away
 				end
@@ -3758,7 +3759,7 @@ ev:SetScript("OnEvent", function(_, event, ...)
 			if pending.stage == "buying" then Timing("buy", GetTime() - pending.t) end
 			SetStatus("Purchase failed (someone else got it?). Nothing bought.", 1, 0.4, 0.4)
 			results[pending.itemID] = nil
-			if pending.scan then scanBatch = nil else priorityID = pending.itemID end
+			if pending.scan then Q.scanBatch = nil else priorityID = pending.itemID end
 			pending = nil
 			HS.Refresh()
 		end
