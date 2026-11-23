@@ -33,7 +33,7 @@ local DEFAULTS = {
 	sound = true,
 	locked = false, -- drag the window anywhere; tick "Lock window position" in Settings to pin it
 	autoBuy = true, -- buy as soon as the price comes back (one-press buying)
-	wheelCheck = true, -- Focus: a press with no deal on screen asks the game for the price directly
+	wheelCheck = false, -- Focus: a press with no deal on screen asks the game for a small batch's price (off: buys whole batches from searches)
 	wheelQty = 5, -- how many each of those price checks asks for (a whole big amount would almost never average under the max)
 	countdown = true, -- Focus: quantity is a hard total (untick to buy up to the quantity on every click)
 	resetMinutes = 5, -- Focus count down starts over after this many minutes without buying that item
@@ -565,15 +565,10 @@ local function Fill(cfg, under, typo)
 	return avail, total
 end
 
--- How many the next press buys, and their cost. First bite: on a fresh deal, just the
--- cheapest listing. That's the one everyone races for, and a small buy is less likely to be
--- spoiled by someone else's purchase landing first. The press after that buys the rest in
--- one go (no new search needed).
+-- How many the next press buys, and their cost: everything listed at or under your max, up
+-- to what you still want and can afford, in one purchase. (v0.7.3 to v0.7.7 bought just the
+-- cheapest listing first; by the next press the rest of a cheap batch was usually gone.)
 function HS.NextBite(r)
-	local first = r.under and r.under[1]
-	if not r.firstTaken and first and first.qty > 0 and first.qty < r.avail then
-		return first.qty, first.qty * first.price
-	end
 	return r.avail, r.total
 end
 
@@ -2561,10 +2556,10 @@ The button shows what a click will do:
 - |cffff5555Red:|r your max looks like a typo.
 
 - ]] .. H .. [[One click:|r the click asks the auction house for the exact price, and the addon buys straight away if it's still at or under your max. If the game ever refuses that, the addon switches to "click again to buy" by itself.
-- ]] .. H .. [[Cheapest first:|r on a new deal, the first click buys just the cheapest listing (the one everyone races for). The next click buys the rest in one go.
+- ]] .. H .. [[Whole batch:|r a click buys everything listed at or under your max in one go, up to your amount.
 - ]] .. H .. [[Keep buying:|r spam the button. After each buy, your next click buys more of what's left without waiting for a new search. Every buy is still price-checked first.
 - ]] .. H .. [[Fastest:|r bind Buy to your mouse wheel (Key Bindings, AddOns, Helpme Sniper). Every wheel notch is one press. Keep the mouse off the auction house window and off lists, or the wheel scrolls them instead.
-- ]] .. H .. [[Price checks (Focus):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a buy, the next check asks for double (5, 10, 20, 40...) up to what's left of your amount, so a big cheap batch goes in a few buys; back to the starting size when a check comes back over your max. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
+- ]] .. H .. [[Price checks (Focus, off unless you turn them on):|r keep scrolling while you wait. With no deal on screen, each press asks the game what a small batch (5, or /hsnipe wheel 3 for 3) costs right now and buys it if it averages at or under your max, without waiting for a search to spot the deal. After a buy, the next check asks for double (5, 10, 20, 40...) up to what's left of your amount, so a big cheap batch goes in a few buys; back to the starting size when a check comes back over your max. Searches pause while you keep pressing. Turn it off in Settings or with /hsnipe wheel off.
 - ]] .. H .. [[Someone beat you?|r If the price comes back with the average over your max, it cancels and nothing is bought. A little higher than shown but still within your max is bought, so you don't lose the race over a few coppers.]] },
 
 	{ title = "Safety", text = H .. [[Safety|r
@@ -3129,6 +3124,12 @@ local function InitDB()
 	if not db.lists[db.activeList or 1] then db.activeList = 1 end
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil and type(v) ~= "table" then db[k] = v end
+	end
+	-- v0.7.8: wheel price checks are off by default now (they bought 5 at a time instead of the
+	-- whole batch under your max). Switch them off once for settings saved by v0.7.6 and v0.7.7.
+	if not db.wheelDefault078 then
+		db.wheelCheck = false
+		db.wheelDefault078 = true
 	end
 	db.interval = math.min(MAX_INTERVAL, math.max(MIN_INTERVAL, db.interval))
 	HS.UpdateMode()
