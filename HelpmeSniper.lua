@@ -754,7 +754,18 @@ local function ScanPress()
 	if not cfg then return false end
 	if priorityID == id or (awaiting and awaiting.id == id and GetTime() - awaiting.t < 3) then
 		-- A search is about to show the whole batch: the next press after it buys all of it.
-		SetStatus("Looking at the listings for the rest...", 0.8, 0.8, 0.8)
+		SetStatus("Refreshing the listings...", 0.8, 0.8, 0.8)
+		return true
+	end
+	-- A search is due (one every RACE_SEARCH_EVERY seconds while you press): send it from this
+	-- press. While you spam, the next price check goes out the moment the last one answers,
+	-- so the regular search timer almost never finds a gap (v0.7.9: "updated" kept counting
+	-- up the whole time you pressed).
+	local nowP = GetTime()
+	while sendTimes[1] and nowP - sendTimes[1] >= WINDOW_SECONDS do table.remove(sendTimes, 1) end
+	if nowP - lastSend >= RACE_SEARCH_EVERY and #sendTimes < MAX_PER_WINDOW then
+		HS.SendSearch(id, nowP)
+		SetStatus("Refreshing the listings...", 0.8, 0.8, 0.8)
 		return true
 	end
 	local max = MaxFor(cfg, id)
@@ -1039,6 +1050,10 @@ local function Tick()
 	if not CanSend(now) then return end
 	local id = NextItem()
 	if not id then return end
+	HS.SendSearch(id, now)
+end
+
+function HS.SendSearch(id, now)
 	lastSend = now
 	lineFreeSince = nil
 	sendTimes[#sendTimes + 1] = now
